@@ -87,19 +87,55 @@ let ready: Promise<void> | undefined;
 /**
  * Creates the schema on first use. Memoized per process, so the cost is one
  * batch on the first request and nothing thereafter.
+ *
+ * A failure here breaks every query in the app, so it is worth naming the exact
+ * statement that failed. The usual cause is pointing at a database that already
+ * holds a different app's tables: `CREATE TABLE IF NOT EXISTS` quietly skips the
+ * conflicting table, and the first statement that depends on a missing column is
+ * the one that blows up.
  */
 function ensureSchema(): Promise<void> {
   if (!ready) {
-    ready = getClient()
-      .batch(SCHEMA, "write")
-      .then(() => undefined)
-      .catch((error) => {
-        // Let the next request retry rather than caching the failure forever.
-        ready = undefined;
-        throw error;
-      });
+    ready = runSchema().catch((error) => {
+      // Let the next request retry rather than caching the failure forever.
+      ready = undefined;
+      throw error;
+    });
   }
   return ready;
+}
+
+async function runSchema(): Promise<void> {
+  const client = getClient();
+
+  try {
+    await client.batch(SCHEMA, "write");
+  } catch {
+    // Re-run one at a time so the error can name the offending statement
+    // instead of surfacing as an opaque 500.
+    for (const statement of SCHEMA) {
+      try {
+        await client.execute(statement);
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        throw new Error(
+          `Gatehouse could not set up its schema.\n` +
+            `Failing statement: ${statement.replace(/\s+/g, " ").trim()}\n` +
+            `Database error: ${detail}\n` +
+            `Database URL: ${describeTarget()}\n` +
+            `If that database already contains another app's tables, point ` +
+            `TURSO_DATABASE_URL at a fresh database — Gatehouse cannot share one.`,
+          { cause: error },
+        );
+      }
+    }
+  }
+}
+
+/** The host only — never the auth token. */
+function describeTarget(): string {
+  const url = process.env.TURSO_DATABASE_URL ?? "(unset)";
+  return url.startsWith("file:") ? url : url.split("?")[0];
 }
 
 export type Row = Record<string, unknown>;
