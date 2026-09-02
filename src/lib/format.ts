@@ -23,7 +23,18 @@ export function formatDateTime(value: string): string {
 
 export const STATUS_LABELS: Record<string, string> = {
   "open": "Open",
+  "pending": "Waiting on customer",
   "in-progress": "In progress",
+  "resolved": "Resolved",
+  "closed": "Closed",
+};
+
+/** The short form, for a tab or a table cell where the full label is too wide. */
+export const STATUS_SHORT_LABELS: Record<string, string> = {
+  "open": "Open",
+  "pending": "Waiting",
+  "in-progress": "In progress",
+  "resolved": "Resolved",
   "closed": "Closed",
 };
 

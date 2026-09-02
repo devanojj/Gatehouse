@@ -81,12 +81,73 @@ const SCHEMA = [
     source_message_id TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
   )`,
+  `CREATE TABLE IF NOT EXISTS queues (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    org_id INTEGER NOT NULL REFERENCES organizations(id),
+    name TEXT NOT NULL,
+    description TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  )`,
+  // A queue only ever holds agents of its own organization; `org_id` is carried
+  // here too so membership can be filtered without joining through `queues`.
+  `CREATE TABLE IF NOT EXISTS queue_members (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    org_id INTEGER NOT NULL REFERENCES organizations(id),
+    queue_id INTEGER NOT NULL REFERENCES queues(id),
+    agent_id INTEGER NOT NULL REFERENCES agents(id),
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE (queue_id, agent_id)
+  )`,
+  `CREATE TABLE IF NOT EXISTS macros (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    org_id INTEGER NOT NULL REFERENCES organizations(id),
+    name TEXT NOT NULL,
+    body TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+  )`,
+  // Append-only: rows are written beside the mutation they describe and never
+  // updated or deleted, so the timeline of a ticket cannot be rewritten.
+  `CREATE TABLE IF NOT EXISTS ticket_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    org_id INTEGER NOT NULL REFERENCES organizations(id),
+    ticket_id INTEGER NOT NULL REFERENCES tickets(id),
+    agent_id INTEGER REFERENCES agents(id),
+    type TEXT NOT NULL,
+    old_value TEXT,
+    new_value TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  )`,
+  `CREATE TABLE IF NOT EXISTS attachments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    org_id INTEGER NOT NULL REFERENCES organizations(id),
+    ticket_id INTEGER NOT NULL REFERENCES tickets(id),
+    comment_id INTEGER REFERENCES comments(id),
+    agent_id INTEGER REFERENCES agents(id),
+    filename TEXT NOT NULL,
+    content_type TEXT NOT NULL,
+    size_bytes INTEGER NOT NULL,
+    storage_key TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  )`,
   // Tenant-scoped lookups always lead with org_id, so the indexes do too.
   `CREATE INDEX IF NOT EXISTS idx_tickets_org ON tickets(org_id, created_at DESC)`,
   `CREATE INDEX IF NOT EXISTS idx_comments_org_ticket ON comments(org_id, ticket_id, created_at)`,
   `CREATE INDEX IF NOT EXISTS idx_agents_org ON agents(org_id, name)`,
   `CREATE INDEX IF NOT EXISTS idx_sessions_token ON sessions(token)`,
   `CREATE INDEX IF NOT EXISTS idx_magic_links_token ON magic_links(token)`,
+  `CREATE INDEX IF NOT EXISTS idx_queues_org ON queues(org_id, name)`,
+  `CREATE INDEX IF NOT EXISTS idx_queue_members_org_queue
+     ON queue_members(org_id, queue_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_queue_members_org_agent
+     ON queue_members(org_id, agent_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_macros_org ON macros(org_id, name)`,
+  `CREATE INDEX IF NOT EXISTS idx_ticket_events_org_ticket
+     ON ticket_events(org_id, ticket_id, created_at, id)`,
+  `CREATE INDEX IF NOT EXISTS idx_attachments_org_ticket
+     ON attachments(org_id, ticket_id, created_at)`,
+  `CREATE INDEX IF NOT EXISTS idx_attachments_org_comment
+     ON attachments(org_id, comment_id)`,
 ];
 
 /**
@@ -101,6 +162,7 @@ const ADDED_COLUMNS = [
   { table: "organizations", column: "support_email" },
   { table: "organizations", column: "inbound_slug" },
   { table: "tickets", column: "source_message_id" },
+  { table: "tickets", column: "queue_id", type: "INTEGER" },
   { table: "comments", column: "author_email" },
   { table: "comments", column: "source_message_id" },
 ] as const;
@@ -124,6 +186,9 @@ const POST_MIGRATION_INDEXES = [
   // Threading a reply onto the sender's most recent open ticket.
   `CREATE INDEX IF NOT EXISTS idx_tickets_requester
      ON tickets(org_id, requester_email, created_at DESC)`,
+  // The queue views on the ticket list.
+  `CREATE INDEX IF NOT EXISTS idx_tickets_queue
+     ON tickets(org_id, queue_id, created_at DESC)`,
 ];
 
 let ready: Promise<void> | undefined;
@@ -192,11 +257,15 @@ async function createTables(client: Client): Promise<void> {
  *
  * All of them are nullable with no default, so `ALTER TABLE ... ADD COLUMN` is
  * an instant metadata change on an existing table — no rewrite, no downtime.
+ * `type` defaults to TEXT; a column holding a row id says so, since SQLite
+ * compares an integer against the text `'3'` as unequal.
  */
 async function addMissingColumns(client: Client): Promise<void> {
   const seen = new Map<string, Set<string>>();
 
-  for (const { table, column } of ADDED_COLUMNS) {
+  for (const definition of ADDED_COLUMNS) {
+    const { table, column } = definition;
+    const type = "type" in definition ? definition.type : "TEXT";
     let columns = seen.get(table);
     if (!columns) {
       const info = await client.execute(`PRAGMA table_info(${table})`);
@@ -206,7 +275,7 @@ async function addMissingColumns(client: Client): Promise<void> {
 
     if (columns.has(column)) continue;
 
-    await client.execute(`ALTER TABLE ${table} ADD COLUMN ${column} TEXT`);
+    await client.execute(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
     columns.add(column);
   }
 }
@@ -277,4 +346,23 @@ export async function insert(sql: string, args: unknown[] = []): Promise<number>
 export async function execute(sql: string, args: unknown[] = []): Promise<void> {
   await ensureSchema();
   await getClient().execute({ sql, args: args as never });
+}
+
+/** One parameterized statement, for `batchWrite`. */
+export type Statement = { sql: string; args: unknown[] };
+
+/**
+ * Runs several writes in one transaction.
+ *
+ * This is how a mutation and the `ticket_events` row describing it are written
+ * together: libSQL wraps a batch in a transaction, so either both land or
+ * neither does and the timeline cannot drift from the ticket it describes.
+ */
+export async function batchWrite(statements: Statement[]): Promise<void> {
+  if (statements.length === 0) return;
+  await ensureSchema();
+  await getClient().batch(
+    statements.map(({ sql, args }) => ({ sql, args: args as never })),
+    "write",
+  );
 }

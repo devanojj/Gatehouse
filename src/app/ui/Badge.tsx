@@ -3,7 +3,11 @@ import type { Priority, Status } from "@/lib/tickets";
 
 const STATUS_TONE: Record<Status, string> = {
   "open": "badge-amber",
+  // Waiting on the customer: nothing for us to do, but not finished either.
+  "pending": "badge-violet",
   "in-progress": "badge-blue",
+  // An answer given and holding, until the customer accepts it or writes back.
+  "resolved": "badge-teal",
   "closed": "badge-gray",
 };
 

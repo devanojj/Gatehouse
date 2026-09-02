@@ -60,6 +60,9 @@ function describe(summary: InboxCheckState["summary"]): string {
   if (summary.appended > 0) {
     parts.push(`${plural(summary.appended, "reply", "replies")} added to existing tickets`);
   }
+  if (summary.reopened > 0) {
+    parts.push(`${plural(summary.reopened, "ticket")} reopened`);
+  }
   if (summary.duplicates > 0) {
     parts.push(`${plural(summary.duplicates, "message")} already filed`);
   }

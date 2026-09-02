@@ -46,3 +46,6 @@ next-env.d.ts
 # local sqlite dev database
 *.db
 *.db-journal
+
+# attachments written by the local storage fallback
+/.gatehouse-uploads/

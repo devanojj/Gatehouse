@@ -26,6 +26,21 @@ export async function findAgentByEmail(email: string): Promise<Agent | null> {
   ]);
 }
 
+/**
+ * One agent inside an organization. Server Actions call this to turn an id from
+ * a form into a real teammate before using it, so a foreign id is "not found"
+ * rather than a silent no-op.
+ */
+export async function getAgent(
+  orgId: number,
+  agentId: number,
+): Promise<Agent | null> {
+  return queryOne<Agent>(`SELECT * FROM agents WHERE org_id = ? AND id = ?`, [
+    orgId,
+    agentId,
+  ]);
+}
+
 export async function listAgents(orgId: number): Promise<Agent[]> {
   return query<Agent>(
     `SELECT * FROM agents WHERE org_id = ? ORDER BY name COLLATE NOCASE`,
