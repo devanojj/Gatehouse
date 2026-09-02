@@ -1,6 +1,6 @@
 import "server-only";
 
-import { execute, queryOne } from "./db";
+import { execute, query, queryOne } from "./db";
 import { plusAddress } from "./slug";
 
 export type Organization = {
@@ -32,6 +32,16 @@ export async function findOrganizationBySlug(
   return queryOne<Organization>(
     `SELECT * FROM organizations WHERE inbound_slug = ?`,
     [slug],
+  );
+}
+
+/**
+ * Every organization that can receive mail, for the scheduled poll. Ordered by
+ * id so a long backlog is worked in a stable sequence run after run.
+ */
+export async function listOrganizationsWithInbound(): Promise<Organization[]> {
+  return query<Organization>(
+    `SELECT * FROM organizations WHERE inbound_slug IS NOT NULL ORDER BY id`,
   );
 }
 

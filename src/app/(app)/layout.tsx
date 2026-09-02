@@ -30,10 +30,26 @@ export default async function AppLayout({
           <nav className="topbar-nav">
             <NavLink href="/tickets">Tickets</NavLink>
             <NavLink href="/settings/inbox">Inbox</NavLink>
+            <NavLink href="/settings/macros">Macros</NavLink>
             {session.role === "owner" ? (
-              <NavLink href="/settings/team">Team</NavLink>
+              <>
+                <NavLink href="/settings/queues">Queues</NavLink>
+                <NavLink href="/settings/team">Team</NavLink>
+              </>
             ) : null}
           </nav>
+
+          {/* A plain GET form — no client component, no JavaScript. The list
+              page searches inside the session's organization and nowhere
+              else. */}
+          <form className="topbar-search" action="/tickets" role="search">
+            <input
+              type="search"
+              name="q"
+              aria-label="Search tickets"
+              placeholder="Search tickets…"
+            />
+          </form>
 
           <div className="topbar-right">
             <div className="whoami">

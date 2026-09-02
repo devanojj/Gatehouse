@@ -98,3 +98,15 @@ TURSO_DATABASE_URL=file:./scratch.db npm run dev
 - **An environment variable** — `.env.local.example`, the matching README
   section, and Vercel production. A variable added *after* a deployment is not
   in the running build until you redeploy.
+- **A ticket mutation** — does it write a `ticket_events` row in the same
+  `batchWrite`, and does that event resolve its values in SQL rather than take
+  a label from the caller ([`src/lib/ticket-events.ts`](src/lib/ticket-events.ts))?
+- **A status** — `STATUSES`, `ACTIVE_STATUSES`, `REOPEN_STATUSES`,
+  `STATUS_LABELS`/`STATUS_SHORT_LABELS`, the badge tone in
+  [`src/app/ui/Badge.tsx`](src/app/ui/Badge.tsx), the list views, and the
+  inbound reopen rule.
+- **Attachments or storage** — the allow-list and magic-byte check in
+  [`src/lib/attachments.ts`](src/lib/attachments.ts), and both backends in
+  [`src/lib/storage.ts`](src/lib/storage.ts). The download route is the one
+  place that serves bytes; it must keep resolving the id inside the session's
+  org.

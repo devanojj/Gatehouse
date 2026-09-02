@@ -1,9 +1,11 @@
 import { requireSession } from "@/lib/auth";
+import { listQueues } from "@/lib/queues";
 
 import { NewTicketForm } from "./NewTicketForm";
 
 export default async function NewTicketPage() {
-  await requireSession();
+  const session = await requireSession();
+  const queues = await listQueues(session.orgId);
 
   return (
     <>
@@ -15,7 +17,10 @@ export default async function NewTicketPage() {
       </div>
 
       <div className="card card-pad" style={{ maxWidth: 680 }}>
-        <NewTicketForm />
+        {/* Plain props: the form never sees a query or an org id. */}
+        <NewTicketForm
+          queues={queues.map((queue) => ({ id: queue.id, name: queue.name }))}
+        />
       </div>
     </>
   );
