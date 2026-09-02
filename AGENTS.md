@@ -97,7 +97,8 @@ TURSO_DATABASE_URL=file:./scratch.db npm run dev
   the threading rules in [`src/lib/inbound.ts`](src/lib/inbound.ts).
 - **An environment variable** — `.env.local.example`, the matching README
   section, and Vercel production. A variable added *after* a deployment is not
-  in the running build until you redeploy.
+  in the running build until you redeploy. `CRON_SECRET` lives in two places:
+  the Vercel project and the repository secret the polling workflow reads.
 - **A ticket mutation** — does it write a `ticket_events` row in the same
   `batchWrite`, and does that event resolve its values in SQL rather than take
   a label from the caller ([`src/lib/ticket-events.ts`](src/lib/ticket-events.ts))?

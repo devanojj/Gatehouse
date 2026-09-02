@@ -147,10 +147,48 @@ variable in the project's settings and redeploying, nothing else.
 [`vercel.json`](vercel.json) schedules it **once a day**, at 08:00 UTC, because
 that is the most a Hobby account allows: a cron expression that would run more
 than once a day [fails the deployment
-outright](https://vercel.com/docs/cron-jobs/usage-and-pricing). Daily is too
-slow for a support inbox, so on a Pro plan change the schedule to something like
-`*/15 * * * *` and redeploy. Hobby timing is also approximate — an 08:00 job
-runs somewhere in the 08:00 hour.
+outright](https://vercel.com/docs/cron-jobs/usage-and-pricing). That daily run
+is a backstop. The real schedule lives in GitHub Actions, which costs nothing.
+
+### Polling every fifteen minutes without a paid plan
+
+Nothing about `/api/cron/inbound` is Vercel-specific — it authenticates a
+`Bearer` token and takes nothing else from the request, so any clock that can
+send a header can drive it.
+[`.github/workflows/inbound-poll.yml`](.github/workflows/inbound-poll.yml) is
+that clock: a scheduled workflow that calls the deployment every fifteen
+minutes. Scheduled workflows are free on a public repository, and free within
+the monthly Actions minutes on a private one.
+
+Set it up once, in this repository under **Settings → Secrets and variables →
+Actions**:
+
+| | |
+| --- | --- |
+| Variable `GATEHOUSE_URL` | `https://your-deployment.vercel.app` |
+| Secret `CRON_SECRET` | the same value as `CRON_SECRET` in the Vercel project |
+
+Then open the **Actions** tab and run **Poll inbound mail** once by hand. A
+green run that prints `{"ok":true,…}` means the whole path works. The workflow
+reports a wrong secret (401) and an unreachable deployment as failures, and a
+server with no mailbox configured (503) as a notice rather than a failure, so it
+does not email you every fifteen minutes before `GMAIL_USER` is set.
+
+Two things to know about GitHub's scheduler: runs are best effort, so one can be
+late or skipped when the platform is busy — the poll is idempotent, so a missed
+run simply collects more mail next time — and GitHub disables scheduled
+workflows in a repository with no activity for 60 days, which the Vercel daily
+cron quietly covers.
+
+Any other scheduler works the same way, as long as it can send a header:
+
+```bash
+curl -H "Authorization: Bearer $CRON_SECRET" \
+  https://your-deployment.vercel.app/api/cron/inbound
+```
+
+Do not put the secret in the query string of a service that cannot: URLs end up
+in logs.
 
 One organization's failure — a locked mailbox, a malformed message — is caught
 and the rest are still polled. The response counts what happened across the

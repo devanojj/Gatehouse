@@ -1,0 +1,97 @@
+# Scheduled inbound mail collection, without a paid Vercel plan.
+#
+# Vercel Cron refuses anything more frequent than once a day on a Hobby
+# account, so the every-fifteen-minutes schedule lives here instead. All this
+# does is call the deployment's own /api/cron/inbound with the shared secret —
+# the same request Vercel Cron would make, from a different clock. Nothing
+# about the app changes, and the daily Vercel cron in vercel.json stays as a
+# backstop.
+#
+# Set up once, in this repository:
+#
+#   Settings → Secrets and variables → Actions
+#     Variables → New repository variable
+#       GATEHOUSE_URL = https://your-deployment.vercel.app   (no trailing slash)
+#     Secrets → New repository secret
+#       CRON_SECRET   = the same value as CRON_SECRET in the Vercel project
+#
+# Then run it once by hand from the Actions tab to check it works.
+
+name: Poll inbound mail
+
+on:
+  schedule:
+    # Every fifteen minutes. GitHub runs scheduled workflows on a best-effort
+    # basis, so a run can be late or skipped under load; the poll is idempotent,
+    # and a missed one simply collects more mail next time.
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+# No repository access is needed — this only makes an outbound HTTPS request.
+permissions: {}
+
+concurrency:
+  group: inbound-poll
+  cancel-in-progress: false
+
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Call the inbound cron route
+        env:
+          GATEHOUSE_URL: ${{ vars.GATEHOUSE_URL }}
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+        run: |
+          set -u
+
+          if [ -z "${GATEHOUSE_URL}" ] || [ -z "${CRON_SECRET}" ]; then
+            echo "::error::Set the GATEHOUSE_URL repository variable and the CRON_SECRET repository secret (see the comment at the top of this workflow)."
+            exit 1
+          fi
+
+          rm -f response.json
+
+          # The secret travels in a header, never in the URL, so it stays out of
+          # this log and out of any proxy's access log along the way.
+          status=$(curl --silent --show-error --location \
+            --max-time 120 --retry 2 --retry-connrefused \
+            --header "Authorization: Bearer ${CRON_SECRET}" \
+            --output response.json --write-out '%{http_code}' \
+            "${GATEHOUSE_URL%/}/api/cron/inbound") || true
+
+          # `--retry` writes the status once per attempt, so three refused
+          # connections arrive here as "000000". Only the last one is the answer.
+          status=$(printf '%s' "${status}" | tail -c 3)
+          [ -n "${status}" ] || status="000"
+
+          # The body is counts only — how many organizations were polled and what
+          # was filed. It names no tenant and carries no secret.
+          echo "HTTP ${status}"
+          cat response.json 2>/dev/null || true
+          echo
+
+          case "${status}" in
+            200)
+              exit 0
+              ;;
+            503)
+              # The mailbox isn't configured on the server yet. Say so once and
+              # succeed, rather than failing every fifteen minutes until it is.
+              echo "::notice::The shared inbox is not configured on the server. Set GMAIL_USER and GMAIL_APP_PASSWORD there."
+              exit 0
+              ;;
+            401)
+              echo "::error::The server rejected the secret. CRON_SECRET here must match CRON_SECRET in the deployment, and the deployment must have been redeployed since it was set."
+              exit 1
+              ;;
+            000)
+              echo "::error::Could not reach ${GATEHOUSE_URL%/}/api/cron/inbound."
+              exit 1
+              ;;
+            *)
+              echo "::error::The poll failed with HTTP ${status}."
+              exit 1
+              ;;
+          esac
