@@ -140,12 +140,17 @@ CRON_SECRET=$(openssl rand -hex 32)
 
 The route accepts `Authorization: Bearer $CRON_SECRET` and refuses everything
 else with a 401; with no secret configured it refuses every request rather than
-defaulting to open. [`vercel.json`](vercel.json) schedules it every fifteen
-minutes, and Vercel Cron sends that header automatically when the project has a
-`CRON_SECRET` environment variable — so deploying means setting the variable in
-the project's settings and redeploying, nothing else. Cron schedules shorter
-than daily need a paid plan; on Hobby, change the schedule or keep using the
-button.
+defaulting to open. Vercel Cron sends that header automatically when the project
+has a `CRON_SECRET` environment variable — so deploying means setting the
+variable in the project's settings and redeploying, nothing else.
+
+[`vercel.json`](vercel.json) schedules it **once a day**, at 08:00 UTC, because
+that is the most a Hobby account allows: a cron expression that would run more
+than once a day [fails the deployment
+outright](https://vercel.com/docs/cron-jobs/usage-and-pricing). Daily is too
+slow for a support inbox, so on a Pro plan change the schedule to something like
+`*/15 * * * *` and redeploy. Hobby timing is also approximate — an 08:00 job
+runs somewhere in the 08:00 hour.
 
 One organization's failure — a locked mailbox, a malformed message — is caught
 and the rest are still polled. The response counts what happened across the

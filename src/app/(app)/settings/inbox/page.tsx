@@ -125,8 +125,8 @@ export default async function InboxSettingsPage() {
 
         {configured && !scheduled ? (
           <p className="hint" style={{ marginTop: 12 }}>
-            Set CRON_SECRET on the server to let the scheduled poll run every
-            fifteen minutes.
+            Set CRON_SECRET on the server to let the scheduled poll run on a
+            schedule.
           </p>
         ) : null}
       </div>
