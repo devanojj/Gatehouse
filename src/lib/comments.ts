@@ -1,12 +1,20 @@
 import "server-only";
 
-import { insert, query } from "./db";
+import { insert, query, queryOne } from "./db";
 
-export const COMMENT_TYPES = ["public", "internal"] as const;
-export type CommentType = (typeof COMMENT_TYPES)[number];
+/**
+ * What an agent can post from the composer. Deliberately narrower than
+ * `CommentType`: `inbound` is written by the mail fetcher alone, so a crafted
+ * form post cannot make an agent's words look like they came from the client.
+ */
+export const AGENT_COMMENT_TYPES = ["public", "internal"] as const;
+export type AgentCommentType = (typeof AGENT_COMMENT_TYPES)[number];
 
-export function isCommentType(value: unknown): value is CommentType {
-  return COMMENT_TYPES.includes(value as CommentType);
+/** Everything that can appear in a thread. */
+export type CommentType = AgentCommentType | "inbound";
+
+export function isAgentCommentType(value: unknown): value is AgentCommentType {
+  return AGENT_COMMENT_TYPES.includes(value as AgentCommentType);
 }
 
 export type Comment = {
@@ -17,6 +25,8 @@ export type Comment = {
   agent_name: string | null;
   type: CommentType;
   body: string;
+  author_email: string | null;
+  source_message_id: string | null;
   created_at: string;
 };
 
@@ -44,13 +54,42 @@ export async function listComments(
 export async function createComment(
   orgId: number,
   ticketId: number,
-  agentId: number,
+  agentId: number | null,
   type: CommentType,
   body: string,
+  source: { authorEmail?: string | null; messageId?: string | null } = {},
 ): Promise<number> {
   return insert(
-    `INSERT INTO comments (org_id, ticket_id, agent_id, type, body)
-     VALUES (?, ?, ?, ?, ?)`,
-    [orgId, ticketId, agentId, type, body],
+    `INSERT INTO comments
+       (org_id, ticket_id, agent_id, type, body, author_email, source_message_id)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    [
+      orgId,
+      ticketId,
+      agentId,
+      type,
+      body,
+      source.authorEmail ?? null,
+      source.messageId ?? null,
+    ],
   );
+}
+
+/**
+ * Whether an inbound message has already been filed in this org, as either a
+ * ticket or a comment. The IMAP `\Seen` flag is shared mutable state that
+ * anyone with the mailbox open can clear, so it is not trusted on its own.
+ */
+export async function messageAlreadyFiled(
+  orgId: number,
+  messageId: string,
+): Promise<boolean> {
+  const hit = await queryOne<{ found: number }>(
+    `SELECT 1 AS found FROM comments WHERE org_id = ? AND source_message_id = ?
+     UNION ALL
+     SELECT 1 AS found FROM tickets  WHERE org_id = ? AND source_message_id = ?
+     LIMIT 1`,
+    [orgId, messageId, orgId, messageId],
+  );
+  return hit !== null;
 }

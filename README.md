@@ -39,6 +39,8 @@ the `/login/verify?token=…` URL out of your terminal to sign in. That is the
 entire login loop, with nothing else configured.
 
 Tables are created lazily on first request, so there is no migration step.
+Columns added after the first release are applied the same way: on connection,
+Gatehouse checks for them and runs `ALTER TABLE` if they are missing.
 
 ## Hosted database
 
@@ -68,6 +70,50 @@ change needed — [`src/lib/email.ts`](src/lib/email.ts) is the single seam
 between the app and an email provider. Also set `APP_URL`, so links in those
 emails point at your deployment instead of localhost.
 
+## Inbound email
+
+Customers write to an address; their mail becomes tickets. One shared Gmail
+mailbox serves every tenant, and plus-addressing keeps them apart: each
+organization gets a generated `inbound_slug` and publishes
+`shared-inbox+<slug>@gmail.com`.
+
+Set the mailbox credentials on the server:
+
+```
+GMAIL_USER=your-shared-inbox@gmail.com
+GMAIL_APP_PASSWORD=an-app-specific-password
+```
+
+Use a [Google App Password](https://support.google.com/accounts/answer/185833),
+not the account password, and enable IMAP on the mailbox. `INBOUND_IMAP_HOST`
+and `INBOUND_IMAP_PORT` default to `imap.gmail.com:993` if you are pointing at
+something other than Gmail.
+
+Each org then opens **Settings → Inbox**, copies its address, and forwards its
+own support mailbox to it. Pressing **Check for new mail** connects over IMAP
+and files anything unread that was addressed to that org:
+
+1. a `[Ticket #12]` marker in the subject wins — the reply joins that ticket;
+2. otherwise the sender's most recent open ticket receives it;
+3. otherwise a new ticket is opened, with the sender as its requester.
+
+Filed messages are flagged `\Seen`. A message that fails to file is left unread
+and retried on the next check, and the message id is recorded on the row so a
+re-delivery (or someone marking the mail unread again) cannot duplicate it.
+
+Replies an agent sends from a ticket go out under the organization's name, with
+`Reply-To` set to that org's inbound address and `[Ticket #N]` on the subject,
+so the customer's answer comes back to the same ticket.
+
+**Routing is by slug only.** An organization's `support_email` is self-declared
+and nobody verifies it, so it is used for display and never for deciding which
+tenant a message belongs to. Mail that reaches the shared inbox without a
+recognized `+slug` is left untouched.
+
+Not handled yet: attachments, HTML-only mail (the ticket is still created, with
+a note in place of the body), trimming quoted reply text, reopening a closed
+ticket when a reply arrives, and scheduled polling — collection is manual.
+
 ## How tenant isolation works
 
 Isolation is enforced in depth rather than in one place:
@@ -89,6 +135,11 @@ Isolation is enforced in depth rather than in one place:
 5. **Assignment can't cross tenants.** `updateAssignee` resolves the agent id
    through a subquery scoped to the same org, so a foreign agent id becomes
    `NULL` instead of an assignment.
+6. **Inbound mail picks a tenant by slug, then stays in it.** The check-mail
+   action takes the org from the session, reads only messages tagged with that
+   org's slug, and files them through the same org-scoped functions — so a
+   `[Ticket #N]` marker naming another tenant's ticket resolves to nothing and
+   opens a fresh ticket instead.
 
 `src/proxy.ts` (Next.js 16 renamed Middleware to Proxy) only checks that a
 session cookie exists, as an optimistic redirect. It deliberately does no
@@ -102,6 +153,7 @@ src/
   app/
     (app)/            signed-in shell — requireSession() runs here
       tickets/        list, new, detail
+      settings/inbox/ inbound address, forwarding, fetch mail
       settings/team/  owner-only
     actions/          all server actions
     login/  signup/   magic-link auth
@@ -112,10 +164,9 @@ src/
 
 ## Deliberately not built
 
-Billing/Stripe, inbound email-to-ticket parsing (the schema and the comment
-`type` field are ready for it, but nothing is wired up), multiple orgs per
-agent, SLAs and automation, a knowledge base, reporting dashboards, and any
-Microsoft 365 integration.
+Billing/Stripe, multiple orgs per agent, SLAs and automation, a knowledge base,
+reporting dashboards, domain verification for support addresses, scheduled mail
+polling, and any Microsoft 365 integration.
 
 ## Notes
 

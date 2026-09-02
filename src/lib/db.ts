@@ -2,6 +2,8 @@ import "server-only";
 
 import { createClient, type Client } from "@libsql/client";
 
+import { newInboundSlug } from "./slug";
+
 let client: Client | undefined;
 
 function getClient(): Client {
@@ -29,6 +31,8 @@ const SCHEMA = [
   `CREATE TABLE IF NOT EXISTS organizations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL,
+    support_email TEXT,
+    inbound_slug TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
   )`,
   `CREATE TABLE IF NOT EXISTS agents (
@@ -62,6 +66,7 @@ const SCHEMA = [
     priority TEXT NOT NULL DEFAULT 'medium',
     requester_email TEXT,
     assigned_agent_id INTEGER REFERENCES agents(id),
+    source_message_id TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
   )`,
@@ -72,6 +77,8 @@ const SCHEMA = [
     agent_id INTEGER REFERENCES agents(id),
     type TEXT NOT NULL DEFAULT 'internal',
     body TEXT NOT NULL,
+    author_email TEXT,
+    source_message_id TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
   )`,
   // Tenant-scoped lookups always lead with org_id, so the indexes do too.
@@ -80,6 +87,43 @@ const SCHEMA = [
   `CREATE INDEX IF NOT EXISTS idx_agents_org ON agents(org_id, name)`,
   `CREATE INDEX IF NOT EXISTS idx_sessions_token ON sessions(token)`,
   `CREATE INDEX IF NOT EXISTS idx_magic_links_token ON magic_links(token)`,
+];
+
+/**
+ * Columns added after the first release. `CREATE TABLE IF NOT EXISTS` silently
+ * skips a table that already exists, so a database created before inbound email
+ * needs these bolted on explicitly.
+ */
+/** How many times to re-roll a generated slug before giving up on a collision. */
+export const SLUG_ATTEMPTS = 5;
+
+const ADDED_COLUMNS = [
+  { table: "organizations", column: "support_email" },
+  { table: "organizations", column: "inbound_slug" },
+  { table: "tickets", column: "source_message_id" },
+  { table: "comments", column: "author_email" },
+  { table: "comments", column: "source_message_id" },
+] as const;
+
+/**
+ * Indexes over the columns above. These run after the migration, never in the
+ * main batch: on an older database the columns do not exist yet when the batch
+ * is executed.
+ */
+const POST_MIGRATION_INDEXES = [
+  // SQLite allows repeated NULLs under a unique index, so organizations that
+  // have not been given a slug yet do not collide with each other.
+  `CREATE UNIQUE INDEX IF NOT EXISTS idx_organizations_inbound_slug
+     ON organizations(inbound_slug)`,
+  // One inbound message may never land twice in the same tenant, whatever the
+  // IMAP \Seen flag says.
+  `CREATE UNIQUE INDEX IF NOT EXISTS idx_tickets_source_message
+     ON tickets(org_id, source_message_id) WHERE source_message_id IS NOT NULL`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS idx_comments_source_message
+     ON comments(org_id, source_message_id) WHERE source_message_id IS NOT NULL`,
+  // Threading a reply onto the sender's most recent open ticket.
+  `CREATE INDEX IF NOT EXISTS idx_tickets_requester
+     ON tickets(org_id, requester_email, created_at DESC)`,
 ];
 
 let ready: Promise<void> | undefined;
@@ -108,6 +152,17 @@ function ensureSchema(): Promise<void> {
 async function runSchema(): Promise<void> {
   const client = getClient();
 
+  await createTables(client);
+  await addMissingColumns(client);
+
+  for (const statement of POST_MIGRATION_INDEXES) {
+    await client.execute(statement);
+  }
+
+  await backfillInboundSlugs(client);
+}
+
+async function createTables(client: Client): Promise<void> {
   try {
     await client.batch(SCHEMA, "write");
   } catch {
@@ -127,6 +182,58 @@ async function runSchema(): Promise<void> {
             `TURSO_DATABASE_URL at a fresh database — Gatehouse cannot share one.`,
           { cause: error },
         );
+      }
+    }
+  }
+}
+
+/**
+ * Adds any column in `ADDED_COLUMNS` that the database is missing.
+ *
+ * All of them are nullable with no default, so `ALTER TABLE ... ADD COLUMN` is
+ * an instant metadata change on an existing table — no rewrite, no downtime.
+ */
+async function addMissingColumns(client: Client): Promise<void> {
+  const seen = new Map<string, Set<string>>();
+
+  for (const { table, column } of ADDED_COLUMNS) {
+    let columns = seen.get(table);
+    if (!columns) {
+      const info = await client.execute(`PRAGMA table_info(${table})`);
+      columns = new Set(info.rows.map((row) => String(row.name)));
+      seen.set(table, columns);
+    }
+
+    if (columns.has(column)) continue;
+
+    await client.execute(`ALTER TABLE ${table} ADD COLUMN ${column} TEXT`);
+    columns.add(column);
+  }
+}
+
+/**
+ * Gives a routing slug to organizations created before inbound email existed.
+ * Without one their settings page has no address to show.
+ */
+async function backfillInboundSlugs(client: Client): Promise<void> {
+  const pending = await client.execute(
+    `SELECT id, name FROM organizations WHERE inbound_slug IS NULL`,
+  );
+
+  for (const row of pending.rows) {
+    const id = Number(row.id);
+    const name = String(row.name);
+
+    // The unique index is the real arbiter; retry if a generated slug is taken.
+    for (let attempt = 0; attempt < SLUG_ATTEMPTS; attempt++) {
+      try {
+        await client.execute({
+          sql: `UPDATE organizations SET inbound_slug = ? WHERE id = ? AND inbound_slug IS NULL`,
+          args: [newInboundSlug(name), id],
+        });
+        break;
+      } catch (error) {
+        if (attempt === SLUG_ATTEMPTS - 1) throw error;
       }
     }
   }

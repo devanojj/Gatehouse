@@ -26,6 +26,7 @@ export type Ticket = {
   requester_email: string | null;
   assigned_agent_id: number | null;
   assigned_agent_name: string | null;
+  source_message_id: string | null;
   created_at: string;
   updated_at: string;
 };
@@ -93,18 +94,41 @@ export async function createTicket(
     description: string | null;
     priority: Priority;
     requesterEmail: string | null;
+    sourceMessageId?: string | null;
   },
 ): Promise<number> {
   return insert(
-    `INSERT INTO tickets (org_id, subject, description, priority, requester_email)
-     VALUES (?, ?, ?, ?, ?)`,
+    `INSERT INTO tickets
+       (org_id, subject, description, priority, requester_email, source_message_id)
+     VALUES (?, ?, ?, ?, ?, ?)`,
     [
       orgId,
       fields.subject,
       fields.description,
       fields.priority,
       fields.requesterEmail,
+      fields.sourceMessageId ?? null,
     ],
+  );
+}
+
+/**
+ * The fallback for a reply whose subject lost the `[Ticket #N]` marker: the
+ * sender's most recent ticket that is still being worked on. Closed tickets are
+ * excluded so a months-old thread is not reopened by a new question.
+ */
+export async function findOpenTicketByRequester(
+  orgId: number,
+  requesterEmail: string,
+): Promise<Ticket | null> {
+  return queryOne<Ticket>(
+    `${SELECT_TICKET}
+      WHERE t.org_id = ?
+        AND t.requester_email = ?
+        AND t.status IN ('open', 'in-progress')
+      ORDER BY t.created_at DESC
+      LIMIT 1`,
+    [orgId, requesterEmail],
   );
 }
 

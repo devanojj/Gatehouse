@@ -23,11 +23,17 @@ export async function signup(
   const orgName = String(formData.get("orgName") ?? "").trim();
   const name = String(formData.get("name") ?? "").trim();
   const email = normalizeEmail(String(formData.get("email") ?? ""));
+  const supportEmail = normalizeEmail(String(formData.get("supportEmail") ?? ""));
 
   if (!orgName) return { error: "Organization name is required." };
   if (!name) return { error: "Your name is required." };
   if (!EMAIL_PATTERN.test(email)) {
     return { error: "Enter a valid email address." };
+  }
+  // Optional — a workspace is usable before its support address is decided,
+  // and it can be set later under Settings → Inbox.
+  if (supportEmail && !EMAIL_PATTERN.test(supportEmail)) {
+    return { error: "Enter a valid support email address, or leave it blank." };
   }
 
   if (await findAgentByEmail(email)) {
@@ -37,7 +43,12 @@ export async function signup(
     };
   }
 
-  const { agentId } = await createOrganizationWithOwner(orgName, name, email);
+  const { agentId } = await createOrganizationWithOwner(
+    orgName,
+    name,
+    email,
+    supportEmail || null,
+  );
   await sendMagicLink(agentId, email);
 
   return { sentTo: email };
