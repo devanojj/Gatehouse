@@ -29,6 +29,7 @@ export default async function AppLayout({
 
           <nav className="topbar-nav">
             <NavLink href="/tickets">Tickets</NavLink>
+            <NavLink href="/settings/inbox">Inbox</NavLink>
             {session.role === "owner" ? (
               <NavLink href="/settings/team">Team</NavLink>
             ) : null}

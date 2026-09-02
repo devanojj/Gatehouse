@@ -26,6 +26,12 @@ export function Composer({ ticketId }: { ticketId: number }) {
         </p>
       ) : null}
 
+      {state.warning ? (
+        <p className="notice notice-warn" role="status">
+          {state.warning}
+        </p>
+      ) : null}
+
       <div className="composer-toggle">
         <label className="composer-choice">
           <input

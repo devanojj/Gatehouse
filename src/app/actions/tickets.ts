@@ -4,7 +4,9 @@ import { redirect } from "next/navigation";
 import { revalidatePath } from "next/cache";
 
 import { requireSession } from "@/lib/auth";
-import { createComment, isCommentType } from "@/lib/comments";
+import { createComment, isAgentCommentType } from "@/lib/comments";
+import { getOrganization } from "@/lib/orgs";
+import { sendTicketReply } from "@/lib/ticket-mail";
 import {
   createTicket,
   getTicket,
@@ -16,7 +18,11 @@ import {
   updateStatus,
 } from "@/lib/tickets";
 
-export type TicketFormState = { error?: string };
+export type TicketFormState = {
+  error?: string;
+  /** The comment was saved, but the email alongside it was not sent. */
+  warning?: string;
+};
 
 /**
  * Resolves a ticket id from a form against the caller's own org.
@@ -36,7 +42,7 @@ async function requireTicketAccess(formData: FormData) {
   const ticket = await getTicket(session.orgId, ticketId);
   if (!ticket) throw new Error("Ticket not found.");
 
-  return { session, ticketId };
+  return { session, ticket, ticketId };
 }
 
 export async function createTicketAction(
@@ -104,17 +110,43 @@ export async function addCommentAction(
   _prev: TicketFormState | undefined,
   formData: FormData,
 ): Promise<TicketFormState> {
-  const { session, ticketId } = await requireTicketAccess(formData);
+  const { session, ticket, ticketId } = await requireTicketAccess(formData);
 
   const body = String(formData.get("body") ?? "").trim();
   const type = formData.get("type");
 
   if (!body) return { error: "Write something before posting." };
-  if (!isCommentType(type)) return { error: "Invalid comment type." };
+  if (!isAgentCommentType(type)) return { error: "Invalid comment type." };
 
-  await createComment(session.orgId, ticketId, session.agentId, type, body);
+  await createComment(session.orgId, ticketId, session.agentId, type, body, {
+    authorEmail: session.agentEmail,
+  });
   await touchTicket(session.orgId, ticketId);
 
   revalidatePath(`/tickets/${ticketId}`);
+
+  if (type === "internal") return {};
+
+  // A public reply is meant to reach the requester. The comment is already
+  // saved at this point, so a mail failure is reported as a warning rather than
+  // thrown away with the agent's text.
+  if (!ticket.requester_email) {
+    return {
+      warning:
+        "Saved to the ticket, but not emailed: this ticket has no requester address.",
+    };
+  }
+
+  try {
+    const org = await getOrganization(session.orgId);
+    if (!org) throw new Error("Organization not found.");
+    await sendTicketReply(org, ticket, body, session.agentName);
+  } catch (error) {
+    console.error("Ticket reply could not be sent:", error);
+    return {
+      warning: `Saved to the ticket, but the email to ${ticket.requester_email} could not be sent.`,
+    };
+  }
+
   return {};
 }

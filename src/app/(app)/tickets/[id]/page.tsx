@@ -13,8 +13,22 @@ import { formatDateTime, PRIORITY_LABELS, STATUS_LABELS } from "@/lib/format";
 import { getTicket, PRIORITIES, STATUSES } from "@/lib/tickets";
 import { PriorityBadge, StatusBadge } from "@/app/ui/Badge";
 
+import type { CommentType } from "@/lib/comments";
+
 import { Composer } from "./Composer";
 import { InlineSelect } from "./InlineSelect";
+
+const COMMENT_LABELS: Record<CommentType, string> = {
+  public: "Sent to client",
+  internal: "Internal",
+  inbound: "From client",
+};
+
+const COMMENT_TONE: Record<CommentType, string> = {
+  public: "badge-teal",
+  internal: "badge-amber",
+  inbound: "badge-blue",
+};
 
 export default async function TicketPage({
   params,
@@ -78,14 +92,12 @@ export default async function TicketPage({
                   >
                     <div className="comment-head">
                       <span className="comment-author">
-                        {comment.agent_name ?? "Unknown"}
+                        {comment.type === "inbound"
+                          ? (comment.author_email ?? "Client")
+                          : (comment.agent_name ?? "Unknown")}
                       </span>
-                      <span
-                        className={`badge ${
-                          comment.type === "public" ? "badge-teal" : "badge-amber"
-                        }`}
-                      >
-                        {comment.type === "public" ? "Sent to client" : "Internal"}
+                      <span className={`badge ${COMMENT_TONE[comment.type]}`}>
+                        {COMMENT_LABELS[comment.type]}
                       </span>
                       <span className="comment-time">
                         {formatDateTime(comment.created_at)}

@@ -516,6 +516,11 @@ select {
   color: var(--ink-soft);
 }
 
+.notice-warn {
+  background: var(--amber-soft);
+  color: var(--amber);
+}
+
 /* -------------------------------------------------------------- auth page */
 
 .auth {
@@ -632,6 +637,12 @@ select {
   background: #fffdf5;
 }
 
+/* Mail from the requester — distinct from an agent's reply to them. */
+.comment-inbound {
+  border-left-color: var(--blue);
+  background: #f8fafd;
+}
+
 .comment-head {
   display: flex;
   align-items: center;
@@ -700,4 +711,52 @@ select {
   background: var(--amber-soft);
   border-color: var(--amber);
   color: var(--amber);
+}
+
+/* ---------------------------------------------------------- inbox settings */
+
+.address-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.address {
+  flex: 1;
+  min-width: 240px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 13px;
+  padding: 9px 12px;
+  background: var(--gray-soft);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow-wrap: anywhere;
+}
+
+.steps {
+  margin: 0;
+  padding-left: 20px;
+  color: var(--ink-soft);
+}
+
+.steps li {
+  margin-bottom: 10px;
+}
+
+.steps li:last-child {
+  margin-bottom: 0;
+}
+
+.steps code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  background: var(--gray-soft);
+  padding: 1px 5px;
+  border-radius: 4px;
+}
+
+.label-optional {
+  color: var(--ink-faint);
+  font-weight: 400;
 }

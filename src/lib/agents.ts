@@ -1,6 +1,7 @@
 import "server-only";
 
-import { insert, queryOne, query } from "./db";
+import { insert, queryOne, query, SLUG_ATTEMPTS } from "./db";
+import { newInboundSlug } from "./slug";
 
 export type Agent = {
   id: number;
@@ -32,14 +33,37 @@ export async function listAgents(orgId: number): Promise<Agent[]> {
   );
 }
 
+/**
+ * The inbound slug is generated here, server-side, and never accepted from the
+ * signup form — it is the routing key for a tenant's mail, so a caller must not
+ * be able to choose one that collides with (or impersonates) another org.
+ */
+async function insertOrganization(
+  orgName: string,
+  supportEmail: string | null,
+): Promise<number> {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await insert(
+        `INSERT INTO organizations (name, support_email, inbound_slug)
+         VALUES (?, ?, ?)`,
+        [orgName, supportEmail, newInboundSlug(orgName)],
+      );
+    } catch (error) {
+      // Only a slug collision is worth re-rolling; anything else is a real
+      // failure and should surface.
+      if (attempt >= SLUG_ATTEMPTS) throw error;
+    }
+  }
+}
+
 export async function createOrganizationWithOwner(
   orgName: string,
   agentName: string,
   email: string,
+  supportEmail: string | null = null,
 ): Promise<{ orgId: number; agentId: number }> {
-  const orgId = await insert(`INSERT INTO organizations (name) VALUES (?)`, [
-    orgName,
-  ]);
+  const orgId = await insertOrganization(orgName, supportEmail);
 
   const agentId = await insert(
     `INSERT INTO agents (org_id, name, email, role) VALUES (?, ?, ?, 'owner')`,

@@ -76,6 +76,23 @@ export function SignupForm() {
           <p className="hint">We&rsquo;ll email you a link to sign in — no password.</p>
         </div>
 
+        <div className="field">
+          <label htmlFor="supportEmail">
+            Support address <span className="label-optional">optional</span>
+          </label>
+          <input
+            id="supportEmail"
+            name="supportEmail"
+            type="email"
+            autoComplete="off"
+            placeholder="support@northwind.com"
+          />
+          <p className="hint">
+            The address your customers already write to. Forward it to Gatehouse
+            later to turn incoming mail into tickets.
+          </p>
+        </div>
+
         <div className="form-actions">
           <button className="btn btn-primary" type="submit" disabled={pending}>
             {pending ? "Creating…" : "Create workspace"}
