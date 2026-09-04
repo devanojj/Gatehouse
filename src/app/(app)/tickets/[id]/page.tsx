@@ -80,8 +80,10 @@ function describeEvent(event: TicketEvent): string {
 
   switch (event.kind) {
     case "created":
-      return event.actor_agent_name
-        ? `${who} opened this ticket`
+      if (event.actor_agent_name) return `${who} opened this ticket`;
+      // Tickets opened before the source was recorded carry no value here.
+      return event.to_value === "portal"
+        ? "Opened by the client from the support portal"
         : "Opened from an inbound email";
     case "status_changed":
       return `${who} changed status from ${label(STATUS_LABELS, event.from_value)} to ${label(STATUS_LABELS, event.to_value)}`;

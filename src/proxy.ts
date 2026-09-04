@@ -1,6 +1,6 @@
 import { NextResponse, type NextRequest } from "next/server";
 
-import { SESSION_COOKIE } from "@/lib/session-cookie";
+import { CUSTOMER_SESSION_COOKIE, SESSION_COOKIE } from "@/lib/session-cookie";
 
 /**
  * An optimistic gate, not the real one.
@@ -12,9 +12,23 @@ import { SESSION_COOKIE } from "@/lib/session-cookie";
  * which resolves the cookie against the `sessions` table.
  */
 export function proxy(request: NextRequest) {
-  const hasCookie = request.cookies.has(SESSION_COOKIE);
+  const { pathname } = request.nextUrl;
 
-  if (!hasCookie) {
+  // The portal is a second realm with its own cookie. Its sign-in page lives
+  // under the organization's own slug, so the redirect is built from the path
+  // rather than being a fixed one.
+  const portal = pathname.match(/^\/o\/([^/]+)\/support\/tickets/);
+
+  if (portal) {
+    if (request.cookies.has(CUSTOMER_SESSION_COOKIE)) return NextResponse.next();
+
+    const url = request.nextUrl.clone();
+    url.pathname = `/o/${portal[1]}/support/login`;
+    url.search = "";
+    return NextResponse.redirect(url);
+  }
+
+  if (!request.cookies.has(SESSION_COOKIE)) {
     const url = request.nextUrl.clone();
     url.pathname = "/login";
     url.search = "";
@@ -25,5 +39,9 @@ export function proxy(request: NextRequest) {
 }
 
 export const config = {
-  matcher: ["/tickets/:path*", "/settings/:path*"],
+  matcher: [
+    "/tickets/:path*",
+    "/settings/:path*",
+    "/o/:orgSlug/support/tickets/:path*",
+  ],
 };

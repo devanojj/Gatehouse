@@ -88,6 +88,7 @@ export async function createTicketAction(
     priority,
     requesterEmail: requesterEmail || null,
     actorAgentId: session.agentId,
+    source: "agent",
   });
 
   revalidatePath("/tickets");

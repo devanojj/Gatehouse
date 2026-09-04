@@ -1,5 +1,6 @@
 import "server-only";
 
+import { findOrCreateCustomer } from "./customers";
 import { execute, executeCounting, insert, query, queryOne } from "./db";
 import { recordEvent } from "./events";
 import { ensureDefaultQueue } from "./queues";
@@ -83,6 +84,9 @@ export type Ticket = {
   resolved_at: string | null;
   /** When an agent first replied publicly. Never overwritten. */
   first_response_at: string | null;
+  requester_customer_id: number | null;
+  public_token: string | null;
+  public_token_expires_at: string | null;
   created_at: string;
   updated_at: string;
 };
@@ -184,11 +188,14 @@ export async function getTicket(
   ]);
 }
 
+/** Where a ticket came from, recorded on its opening event. */
+export type TicketSource = "agent" | "email" | "portal";
+
 /**
  * The opening event is written here rather than by the caller, so a ticket
  * cannot reach the timeline without one — whether it came from the agent form,
- * inbound mail, or anywhere added later. `actorAgentId` is null for a ticket
- * the client raised.
+ * inbound mail, or the portal. `actorAgentId` is null for a ticket the client
+ * raised themselves.
  */
 export async function createTicket(
   orgId: number,
@@ -201,6 +208,11 @@ export async function createTicket(
     actorAgentId?: number | null;
     /** Resolved against this org; anything else falls back to the default. */
     queueId?: number | null;
+    requesterCustomerId?: number | null;
+    /** The one-off confirmation link handed back at submission. */
+    publicToken?: string | null;
+    publicTokenExpiresAt?: string | null;
+    source?: TicketSource;
   },
 ): Promise<number> {
   // Every ticket lands in a queue, whether it came from the form, from mail, or
@@ -208,12 +220,24 @@ export async function createTicket(
   // a foreign queue id becomes the default rather than a cross-tenant write.
   const fallbackQueueId = await ensureDefaultQueue(orgId);
 
+  // A requester with an address is a customer of this org, however the ticket
+  // arrived. Doing it here rather than in each caller is what lets someone who
+  // has only ever emailed sign in to the portal and find their history: the row
+  // exists, unverified, until they follow a link sent to that address.
+  const requesterCustomerId =
+    fields.requesterCustomerId ??
+    (fields.requesterEmail
+      ? (await findOrCreateCustomer(orgId, fields.requesterEmail, null)).id
+      : null);
+
   const ticketId = await insert(
     `INSERT INTO tickets
        (org_id, subject, description, priority, requester_email,
-        source_message_id, queue_id)
+        source_message_id, queue_id, requester_customer_id,
+        public_token, public_token_expires_at)
      VALUES (?, ?, ?, ?, ?, ?,
-        COALESCE((SELECT id FROM queues WHERE id = ? AND org_id = ?), ?))`,
+        COALESCE((SELECT id FROM queues WHERE id = ? AND org_id = ?), ?),
+        (SELECT id FROM customers WHERE id = ? AND org_id = ?), ?, ?)`,
     [
       orgId,
       fields.subject,
@@ -224,11 +248,18 @@ export async function createTicket(
       fields.queueId ?? null,
       orgId,
       fallbackQueueId,
+      // Scoped like every other client-supplied id: a customer belonging to
+      // another tenant resolves to NULL rather than linking across the boundary.
+      requesterCustomerId,
+      orgId,
+      fields.publicToken ?? null,
+      fields.publicTokenExpiresAt ?? null,
     ],
   );
 
   await recordEvent(orgId, ticketId, "created", {
     actorAgentId: fields.actorAgentId ?? null,
+    to: fields.source ?? (fields.actorAgentId ? "agent" : "email"),
   });
 
   return ticketId;
@@ -373,6 +404,94 @@ export async function updateQueue(
   );
 
   return rows > 0;
+}
+
+/**
+ * The tickets one verified customer raised with one organization.
+ *
+ * Both ids are required and both are in the WHERE clause: the org alone would
+ * show a customer their tenant's whole queue, and the customer id alone would
+ * cross tenants for an address known to two of them.
+ */
+/**
+ * A reply from the client on a resolved ticket means it was not resolved.
+ *
+ * Shared by inbound mail and the portal so both behave the same way: closed is
+ * never reopened automatically, and the event carries no agent because the
+ * client is the actor.
+ */
+export async function reopenIfResolved(
+  orgId: number,
+  ticket: Pick<Ticket, "id" | "status">,
+): Promise<boolean> {
+  if (ticket.status !== "resolved") return false;
+
+  await updateStatus(orgId, ticket.id, "open");
+  await recordEvent(orgId, ticket.id, "status_changed", {
+    from: "resolved",
+    to: "open",
+  });
+
+  return true;
+}
+
+export async function listCustomerTickets(
+  orgId: number,
+  customerId: number,
+  filters: { status?: Status; search?: string } = {},
+): Promise<Ticket[]> {
+  const clauses = ["t.org_id = ?", "t.requester_customer_id = ?"];
+  const args: unknown[] = [orgId, customerId];
+
+  if (filters.status) {
+    clauses.push("t.status = ?");
+    args.push(filters.status);
+  }
+
+  const search = filters.search?.trim();
+  if (search) {
+    // Reference number or words in the subject — what a customer actually has
+    // to hand. The ticket body is not searched here; it is not theirs to grep.
+    clauses.push("(t.subject LIKE ? OR CAST(t.id AS TEXT) = ?)");
+    args.push(`%${search}%`, search.replace(/^#/, ""));
+  }
+
+  return query<Ticket>(
+    `${SELECT_TICKET} WHERE ${clauses.join(" AND ")} ORDER BY t.created_at DESC`,
+    args,
+  );
+}
+
+export async function getCustomerTicket(
+  orgId: number,
+  customerId: number,
+  ticketId: number,
+): Promise<Ticket | null> {
+  return queryOne<Ticket>(
+    `${SELECT_TICKET}
+      WHERE t.org_id = ? AND t.requester_customer_id = ? AND t.id = ?`,
+    [orgId, customerId, ticketId],
+  );
+}
+
+/**
+ * The unauthenticated confirmation link handed out at submission.
+ *
+ * Read-only, one ticket, and it expires — a support conversation should not sit
+ * behind a URL forever. Anything past the confirmation itself requires signing
+ * in, which is why this is the only query that takes no customer id.
+ */
+export async function getTicketByPublicToken(
+  orgId: number,
+  publicToken: string,
+): Promise<Ticket | null> {
+  return queryOne<Ticket>(
+    `${SELECT_TICKET}
+      WHERE t.org_id = ?
+        AND t.public_token = ?
+        AND t.public_token_expires_at > datetime('now')`,
+    [orgId, publicToken],
+  );
 }
 
 export async function touchTicket(

@@ -392,8 +392,13 @@ td.nowrap {
   margin-top: 6px;
 }
 
-input[type="text"],
-input[type="email"],
+/*
+ * Every text-like input, including one written without a `type`. Listing the
+ * types instead left a bare `<input>` unstyled — a narrow browser default in
+ * the middle of a form — so the exclusions name the controls that have their
+ * own rules rather than the ones that need these.
+ */
+input:not([type="checkbox"]):not([type="radio"]):not([type="hidden"]),
 select,
 textarea {
   width: 100%;
@@ -618,6 +623,108 @@ select {
   display: flex;
   flex-direction: column;
   gap: 14px;
+}
+
+/* --------------------------------------------------------------- portal */
+
+/*
+ * The customer side. Deliberately quieter than the agent workspace: one column,
+ * more air, and none of the operational furniture.
+ */
+.portal {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--paper);
+}
+
+.portal-bar {
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+}
+
+.portal-bar-inner {
+  max-width: 760px;
+  margin: 0 auto;
+  padding: 14px 24px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+
+.portal-nav {
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  font-size: 14px;
+}
+
+.portal-nav a {
+  color: var(--ink-soft);
+  text-decoration: none;
+}
+
+.portal-nav a:hover {
+  color: var(--ink);
+}
+
+.portal-main {
+  flex: 1;
+  width: 100%;
+  max-width: 760px;
+  margin: 0 auto;
+  padding: 40px 24px 64px;
+}
+
+.portal-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+.portal-panel-narrow {
+  max-width: 480px;
+}
+
+.portal-hero {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  padding: 32px 0 8px;
+}
+
+.portal-hero h1 {
+  max-width: 18ch;
+}
+
+.portal-actions {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.portal-search {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.portal-search input {
+  margin: 0;
+  flex: 1;
+}
+
+.portal-foot {
+  border-top: 1px solid var(--border);
+  padding: 20px 24px;
+  text-align: center;
+}
+
+.portal-foot p {
+  margin: 0;
+  font-size: 13px;
 }
 
 /* ------------------------------------------------------------- comments */

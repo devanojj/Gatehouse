@@ -23,6 +23,12 @@ export default async function InboxSettingsPage() {
   const address = inboundAddressFor(org);
   const configured = inboundCredentials() !== null;
 
+  // The portal has no host of its own yet, so the link is built from APP_URL —
+  // the same variable the magic links in outbound mail use.
+  const portalUrl = org.portal_slug
+    ? `${(process.env.APP_URL ?? "http://localhost:3000").replace(/\/$/, "")}/o/${org.portal_slug}`
+    : null;
+
   return (
     <>
       <div className="page-head">
@@ -33,6 +39,25 @@ export default async function InboxSettingsPage() {
             tickets here.
           </p>
         </div>
+      </div>
+
+      <div className="card card-pad">
+        <div className="section-title">Your support portal</div>
+
+        {portalUrl ? (
+          <>
+            <p className="muted" style={{ marginBottom: 16 }}>
+              Customers raise requests here and follow them without an account —
+              they sign in with a link sent to the address they wrote from.
+            </p>
+            <InboundAddress address={portalUrl} />
+          </>
+        ) : (
+          <p className="notice notice-info">
+            This workspace has no portal address yet. Reload the page — one is
+            generated automatically.
+          </p>
+        )}
       </div>
 
       <div className="card card-pad">

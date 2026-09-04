@@ -1,7 +1,6 @@
 import "server-only";
 
 import { createComment, messageAlreadyFiled } from "./comments";
-import { recordEvent } from "./events";
 import { inboundCredentials, type Organization } from "./orgs";
 import { slugFromAddress } from "./slug";
 import { ticketIdFromSubject } from "./ticket-mail";
@@ -9,8 +8,8 @@ import {
   createTicket,
   findOpenTicketByRequester,
   getTicket,
+  reopenIfResolved,
   touchTicket,
-  updateStatus,
 } from "./tickets";
 
 /** One click never files more than this, so the action cannot run long. */
@@ -122,15 +121,7 @@ export async function fileMessage(
     });
     await touchTicket(org.id, existing.id);
 
-    // A reply to something marked resolved means it was not. The client is the
-    // actor here, so the event carries no agent.
-    if (existing.status === "resolved") {
-      await updateStatus(org.id, existing.id, "open");
-      await recordEvent(org.id, existing.id, "status_changed", {
-        from: "resolved",
-        to: "open",
-      });
-    }
+    await reopenIfResolved(org.id, existing);
 
     return { outcome: "appended", ticketId: existing.id };
   }
@@ -141,6 +132,7 @@ export async function fileMessage(
     priority: "medium",
     requesterEmail: message.from,
     sourceMessageId: message.messageId,
+    source: "email",
   });
 
   return { outcome: "created", ticketId };

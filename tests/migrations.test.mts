@@ -159,6 +159,43 @@ test("a pre-migration database converges without losing rows", async () => {
     0,
     "every existing ticket should have been put in the default queue",
   );
+
+  // The portal slug is readable, unlike the inbound one, and every existing
+  // organization needs one or its portal has no address.
+  const portal = await client.execute(
+    `SELECT portal_slug, inbound_slug FROM organizations WHERE id = 1`,
+  );
+  assert.equal(portal.rows[0].portal_slug, "legacy-co");
+  assert.notEqual(portal.rows[0].portal_slug, portal.rows[0].inbound_slug);
+});
+
+test("portal slugs stay unique when two orgs share a name", async () => {
+  const client = freshClient("samename.db");
+
+  await client.batch(
+    [
+      `CREATE TABLE organizations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      )`,
+      `INSERT INTO organizations (name) VALUES ('Northwind')`,
+      `INSERT INTO organizations (name) VALUES ('Northwind')`,
+      `INSERT INTO organizations (name) VALUES ('northwind')`,
+    ],
+    "write",
+  );
+
+  await runMigrations(client);
+
+  const slugs = await client.execute(
+    `SELECT portal_slug FROM organizations ORDER BY id`,
+  );
+
+  assert.deepEqual(
+    slugs.rows.map((row) => String(row.portal_slug)),
+    ["northwind", "northwind-2", "northwind-3"],
+  );
 });
 
 test("a failing migration is rolled back and named", async () => {

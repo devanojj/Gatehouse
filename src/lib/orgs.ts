@@ -1,13 +1,15 @@
 import "server-only";
 
 import { execute, queryOne } from "./db";
-import { plusAddress } from "./slug";
+import { plusAddress, slugifyOrgName } from "./slug";
 
 export type Organization = {
   id: number;
   name: string;
   support_email: string | null;
   inbound_slug: string | null;
+  /** The readable slug in the customer portal's URL. */
+  portal_slug: string | null;
   created_at: string;
 };
 
@@ -33,6 +35,45 @@ export async function findOrganizationBySlug(
     `SELECT * FROM organizations WHERE inbound_slug = ?`,
     [slug],
   );
+}
+
+/**
+ * Resolves a portal URL to the organization whose portal it is.
+ *
+ * Like `findOrganizationBySlug`, the match is exact: no prefix or
+ * case-insensitive matching that could land a visitor in the wrong tenant. This
+ * decides which portal is being *viewed*; it never decides whose tickets may be
+ * read — a customer session does that.
+ */
+export async function findOrganizationByPortalSlug(
+  slug: string,
+): Promise<Organization | null> {
+  return queryOne<Organization>(
+    `SELECT * FROM organizations WHERE portal_slug = ?`,
+    [slug],
+  );
+}
+
+/**
+ * A free, readable slug for a new organization's portal.
+ *
+ * The backfill in migration 005 does the same thing for organizations that
+ * existed before the portal did; this is the path every new one takes. The
+ * unique index is the real arbiter — a caller that loses a race re-rolls.
+ */
+export async function availablePortalSlug(name: string): Promise<string> {
+  const base = slugifyOrgName(name);
+
+  for (let suffix = 1; ; suffix++) {
+    const candidate = suffix === 1 ? base : `${base}-${suffix}`;
+
+    const taken = await queryOne(
+      `SELECT 1 FROM organizations WHERE portal_slug = ?`,
+      [candidate],
+    );
+
+    if (!taken) return candidate;
+  }
 }
 
 export async function setSupportEmail(

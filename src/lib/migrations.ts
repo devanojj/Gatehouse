@@ -2,7 +2,7 @@ import "server-only";
 
 import type { Client, Transaction } from "@libsql/client";
 
-import { newInboundSlug, SLUG_ATTEMPTS } from "./slug";
+import { newInboundSlug, slugifyOrgName, SLUG_ATTEMPTS } from "./slug";
 
 /**
  * Ordered, run-once schema changes.
@@ -246,7 +246,105 @@ export const MIGRATIONS: Migration[] = [
       );
     },
   },
+
+  {
+    // The customer side: a second identity realm, with its own links, its own
+    // sessions, and no overlap with `agents`. A person may be a customer of
+    // several organizations, so identity is unique per org rather than global.
+    name: "005_customer_portal",
+    up: async (tx) => {
+      await run(tx, [
+        `CREATE TABLE IF NOT EXISTS customers (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          org_id INTEGER NOT NULL REFERENCES organizations(id),
+          email TEXT NOT NULL,
+          name TEXT,
+          verified_at TEXT,
+          created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )`,
+        `CREATE UNIQUE INDEX IF NOT EXISTS idx_customers_org_email
+           ON customers(org_id, email)`,
+        `CREATE TABLE IF NOT EXISTS customer_magic_links (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          customer_id INTEGER NOT NULL REFERENCES customers(id),
+          token TEXT NOT NULL UNIQUE,
+          expires_at TEXT NOT NULL,
+          used_at TEXT
+        )`,
+        `CREATE TABLE IF NOT EXISTS customer_sessions (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          customer_id INTEGER NOT NULL REFERENCES customers(id),
+          token TEXT NOT NULL UNIQUE,
+          expires_at TEXT NOT NULL,
+          created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )`,
+        `CREATE INDEX IF NOT EXISTS idx_customer_sessions_token
+           ON customer_sessions(token)`,
+        `CREATE INDEX IF NOT EXISTS idx_customer_magic_links_token
+           ON customer_magic_links(token)`,
+      ]);
+
+      await addColumn(tx, "organizations", "portal_slug");
+      await addColumn(
+        tx,
+        "tickets",
+        "requester_customer_id",
+        "INTEGER REFERENCES customers(id)",
+      );
+      // The one-off link handed out at submission time. It is not a session:
+      // it opens a single ticket's confirmation and it expires.
+      await addColumn(tx, "tickets", "public_token");
+      await addColumn(tx, "tickets", "public_token_expires_at");
+
+      await run(tx, [
+        `CREATE UNIQUE INDEX IF NOT EXISTS idx_organizations_portal_slug
+           ON organizations(portal_slug)`,
+        `CREATE UNIQUE INDEX IF NOT EXISTS idx_tickets_public_token
+           ON tickets(public_token) WHERE public_token IS NOT NULL`,
+        `CREATE INDEX IF NOT EXISTS idx_tickets_requester_customer
+           ON tickets(org_id, requester_customer_id, created_at DESC)`,
+      ]);
+
+      await backfillPortalSlugs(tx);
+    },
+  },
 ];
+
+/**
+ * Gives every organization a readable slug for its customer portal.
+ *
+ * Deliberately not the inbound slug: that one carries a random suffix precisely
+ * so a stranger cannot guess another tenant's mail address, while this one is
+ * printed in a URL customers are meant to read and retype. Tying them together
+ * would mean neither could change without breaking the other.
+ */
+async function backfillPortalSlugs(tx: Transaction): Promise<void> {
+  const pending = await tx.execute(
+    `SELECT id, name FROM organizations WHERE portal_slug IS NULL`,
+  );
+
+  for (const row of pending.rows) {
+    const id = Number(row.id);
+    const base = slugifyOrgName(String(row.name));
+
+    for (let suffix = 1; ; suffix++) {
+      const candidate = suffix === 1 ? base : `${base}-${suffix}`;
+
+      const taken = await tx.execute({
+        sql: `SELECT 1 FROM organizations WHERE portal_slug = ?`,
+        args: [candidate],
+      });
+
+      if (taken.rows.length === 0) {
+        await tx.execute({
+          sql: `UPDATE organizations SET portal_slug = ? WHERE id = ?`,
+          args: [candidate, id],
+        });
+        break;
+      }
+    }
+  }
+}
 
 /**
  * How long to keep waiting for another process that is mid-migration. Two

@@ -23,7 +23,9 @@ what it doesn't: conventions, how to verify a change, and what to re-check.
   ([`src/lib/db.ts`](src/lib/db.ts)). Always `?` placeholders, never
   interpolation.
 - Every tenant-scoped function takes `orgId` as its **first** parameter and puts
-  it in the `WHERE` clause. A row id on its own is never enough.
+  it in the `WHERE` clause. A row id on its own is never enough. A function
+  reading a customer's own data takes `customerId` as well, and both go in the
+  `WHERE`: the org alone would show them the whole queue.
 - Schema changes go in [`src/lib/migrations.ts`](src/lib/migrations.ts), as a new
   entry appended to `MIGRATIONS` — never by editing an entry that has already
   shipped, and never by renaming one: the name is what records it as applied, so
@@ -110,6 +112,10 @@ database.
 - **A Server Action** — does it re-resolve every client-supplied id against the
   session's org before use, does a change worth remembering reach `recordEvent`,
   and is it refused on a closed ticket?
+- **Anything the customer portal renders** — does it come through
+  `toPortalTicket` / `toPortalMessages`? Those are the only conversion from an
+  agent-side row to a customer-side one, and they build a new object from named
+  fields on purpose. Never render a `Ticket` or a `Comment` under `app/o/`.
 - **A control on the ticket page** — a closed ticket is read-only. Disable the
   control as well as refusing the write, so the UI never offers something the
   action will only throw on.

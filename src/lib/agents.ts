@@ -1,6 +1,7 @@
 import "server-only";
 
 import { insert, queryOne, query } from "./db";
+import { availablePortalSlug } from "./orgs";
 import { ensureDefaultQueue } from "./queues";
 import { newInboundSlug, SLUG_ATTEMPTS } from "./slug";
 
@@ -45,10 +46,19 @@ async function insertOrganization(
 ): Promise<number> {
   for (let attempt = 1; ; attempt++) {
     try {
+      // Two slugs, for two different jobs: the inbound one is a mail routing
+      // key with a random suffix so it cannot be guessed, the portal one is a
+      // readable URL customers retype. Both are re-derived on each attempt so a
+      // retry after a collision actually picks something new.
       return await insert(
-        `INSERT INTO organizations (name, support_email, inbound_slug)
-         VALUES (?, ?, ?)`,
-        [orgName, supportEmail, newInboundSlug(orgName)],
+        `INSERT INTO organizations (name, support_email, inbound_slug, portal_slug)
+         VALUES (?, ?, ?, ?)`,
+        [
+          orgName,
+          supportEmail,
+          newInboundSlug(orgName),
+          await availablePortalSlug(orgName),
+        ],
       );
     } catch (error) {
       // Only a slug collision is worth re-rolling; anything else is a real

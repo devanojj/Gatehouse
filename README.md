@@ -6,7 +6,8 @@ each organization sees only its own tickets, agents, and conversations.
 - Next.js (App Router) + TypeScript
 - Turso / libSQL through `@libsql/client` — raw SQL, no ORM
 - Server Actions for every write; no REST or API route handlers
-- Magic-link auth, no passwords; session token in an HTTP-only cookie
+- Magic-link auth, no passwords; session token in an HTTP-only cookie — two
+  separate realms, one for agents and one for customers
 - Plain CSS, one `globals.css` of variables — no Tailwind, no UI library
 
 ## Running it locally
@@ -33,9 +34,9 @@ Then start the dev server:
 npm run dev
 ```
 
-`npm test` runs the suite — tenant isolation, queues and claiming, the ticket
-status model, and the migration runner — against throwaway SQLite files. No
-configuration needed.
+`npm test` runs the suite — tenant isolation, queues and claiming, the portal's
+audience filter, the ticket status model, and the migration runner — against
+throwaway SQLite files. No configuration needed.
 
 Open http://localhost:3000 and create a workspace at `/signup`. With no
 `RESEND_API_KEY` set, magic links are **printed to the server console** — copy
@@ -166,11 +167,43 @@ src/
     actions/          all server actions
     login/  signup/   magic-link auth
     ui/               logo, badges, nav
+  o/[orgSlug]/        the customer portal — its own shell and sign-in
   lib/                db, auth, email, and per-table data access
     migrations.ts     ordered schema changes, applied on first use
-  proxy.ts            optimistic cookie check
+    portal.ts         the one agent-side → customer-side conversion
+  proxy.ts            optimistic cookie check, both realms
 tests/                node --test, one scratch database per file
 ```
+
+## The customer portal
+
+Each organization has a portal at `/o/<portal-slug>` — the slug is readable and
+generated from the name, deliberately *not* the inbound mail slug, whose random
+suffix exists so a stranger cannot guess another tenant's address. Owners find
+the link under **Settings → Inbox**.
+
+Customers raise a request without an account. They get a reference number and a
+confirmation link that opens that one ticket, read-only, for three days. To see
+the conversation — or anything else they have raised — they sign in the same way
+agents do: a link emailed to the address they wrote from.
+
+Anyone who has ever emailed support is already a customer of that organization,
+so signing in shows their emailed tickets too. `createTicket` links a requester
+address to a customer record whatever door the ticket came through.
+
+**What a customer can never see.** Internal notes, assignee names, queue names,
+priorities, and SLA data. There is one conversion from an agent-side row to a
+customer-side one — `toPortalTicket` and `toPortalMessages` in
+[`src/lib/portal.ts`](src/lib/portal.ts) — and it builds a new object from named
+fields rather than deleting fields from the row. A column added to `tickets`
+tomorrow is invisible on the portal until somebody decides otherwise; the
+failure mode is a missing field, not a leaked one.
+
+**Two realms, never one.** Customers have their own table, their own magic
+links, their own sessions, and their own cookie. A customer session can never
+resolve to an agent, and a session belonging to one organization is treated as
+signed out on another's portal. The org slug in the URL says which portal is
+being *viewed*; it never says whose tickets may be read.
 
 ## Queues and ownership
 
