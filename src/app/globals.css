@@ -14,6 +14,8 @@
   --red: #b91c1c;
   --red-soft: #fee2e2;
   --gray-soft: #f4f4f5;
+  --violet: #6d28d9;
+  --violet-soft: #ede9fe;
   --radius: 8px;
 
   /* The palette is a light one by design; keep UA controls in step. */
@@ -325,6 +327,11 @@ td.nowrap {
 .badge-teal {
   background: var(--accent-soft);
   color: var(--accent);
+}
+
+.badge-violet {
+  background: var(--violet-soft);
+  color: var(--violet);
 }
 
 /* ------------------------------------------------------------------ tabs */
@@ -663,6 +670,26 @@ select {
 .comment-body {
   white-space: pre-wrap;
   color: var(--ink-soft);
+}
+
+/*
+ * System events share the thread with comments but are not messages: no card,
+ * no author, indented to the same left edge as a comment's text so the column
+ * still reads as one column.
+ */
+.event {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 0 14px 0 17px;
+  color: var(--ink-soft);
+  font-size: 13px;
+}
+
+.event-time {
+  color: var(--ink-faint);
+  font-size: 12px;
 }
 
 .composer-toggle {

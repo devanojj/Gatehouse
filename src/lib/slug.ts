@@ -78,3 +78,10 @@ export function slugFromAddress(address: string): string | null {
   const slug = localPart.slice(plus + 1).toLowerCase().trim();
   return /^[a-z0-9-]+$/.test(slug) ? slug : null;
 }
+
+/**
+ * How many times to re-roll a generated slug before giving up on a collision.
+ * The unique index on `organizations.inbound_slug` is the real arbiter; this is
+ * only how patient a caller should be about losing the race.
+ */
+export const SLUG_ATTEMPTS = 5;

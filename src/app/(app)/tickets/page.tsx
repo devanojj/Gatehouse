@@ -1,15 +1,19 @@
 import Link from "next/link";
 
 import { requireSession } from "@/lib/auth";
-import { formatDate } from "@/lib/format";
-import { countTicketsByStatus, isStatus, listTickets } from "@/lib/tickets";
+import { formatDate, STATUS_LABELS } from "@/lib/format";
+import { countTicketsByStatus, isStatus, listTickets, STATUSES } from "@/lib/tickets";
 import { PriorityBadge, StatusBadge } from "@/app/ui/Badge";
 
+// Built from STATUSES so a new status cannot appear in the model without
+// appearing here — the tab list and the filter it drives stay one thing.
 const TABS = [
   { key: "all", label: "All", href: "/tickets" },
-  { key: "open", label: "Open", href: "/tickets?status=open" },
-  { key: "in-progress", label: "In progress", href: "/tickets?status=in-progress" },
-  { key: "closed", label: "Closed", href: "/tickets?status=closed" },
+  ...STATUSES.map((status) => ({
+    key: status,
+    label: STATUS_LABELS[status],
+    href: `/tickets?status=${status}`,
+  })),
 ];
 
 export default async function TicketsPage({

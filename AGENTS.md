@@ -24,10 +24,15 @@ what it doesn't: conventions, how to verify a change, and what to re-check.
   interpolation.
 - Every tenant-scoped function takes `orgId` as its **first** parameter and puts
   it in the `WHERE` clause. A row id on its own is never enough.
-- Schema changes: new tables go in `SCHEMA`. A new column on an existing table
-  must *also* go in `ADDED_COLUMNS` — `CREATE TABLE IF NOT EXISTS` silently skips
-  a table that already exists, so a live database never gets the column
-  otherwise. Indexes over those columns belong in `POST_MIGRATION_INDEXES`.
+- Schema changes go in [`src/lib/migrations.ts`](src/lib/migrations.ts), as a new
+  entry appended to `MIGRATIONS` — never by editing an entry that has already
+  shipped, and never by renaming one: the name is what records it as applied, so
+  a rename runs it again on every existing database. Each migration runs in a
+  write transaction with the row that records it, and the runner brings the
+  database up to date on the first query of the process.
+- Write an `up` that is safe to run twice (`IF NOT EXISTS`, `WHERE`-guarded
+  updates, the `addColumn` helper). The transaction makes that belt-and-braces
+  rather than load-bearing, but it keeps a migration usable as a repair.
 
 **Server Actions — `src/app/actions/*.ts`**
 
@@ -66,33 +71,45 @@ relative.
 
 ## Verifying a change
 
-There is no test runner. `npm run lint` and `npm run build` are the only
-automated checks; everything else is exercised by hand against a scratch
-database:
+`npm run lint`, `npm run build`, and `npm test` are the automated checks. The
+tests run on Node's own runner against a throwaway SQLite file — one per test
+file, created and deleted by [`tests/helpers/harness.mts`](tests/helpers/harness.mts).
+They are `.mts` because the package is CommonJS and the harness needs top-level
+`await`; the `--conditions=react-server` flag is what lets a module importing
+`server-only` load outside Next.
+
+Anything the tests do not cover is exercised by hand against a scratch database:
 
 ```bash
-TURSO_DATABASE_URL=file:./scratch.db npm run dev
+npm run dev:scratch
 ```
+
+That is `TURSO_DATABASE_URL=file:./scratch.db next dev` — a shell variable wins
+over `.env.local`, which is the only thing keeping a local run off the hosted
+database.
 
 - **Never point a local run at the hosted database.** `.env.local` holds the
   production Turso URL, so a plain `npm run dev` writes real tenant rows. A
   `file:` URL needs no auth token and builds its schema on the first request.
 - Isolation changes need two organizations, not one. The test is that org B's
   id — in a form field, a URL, or a `[Ticket #N]` subject marker — reads as
-  "not found" instead of working.
+  "not found" instead of working. Add the case to
+  [`tests/isolation.test.mts`](tests/isolation.test.mts) rather than only
+  clicking it: every exported `lib/` function that takes an `orgId` belongs
+  there.
 - Leave `RESEND_API_KEY` and the `GMAIL_*` variables unset locally. Magic links
   print to the server console and Settings → Inbox explains what is missing, so
   the whole app runs with no provider configured.
-- If you add a test runner, add a `test` script alongside `lint` so it is
-  discoverable.
 
 ## When you change X, check Y
 
 - **A `lib/` query** — does it take `orgId`, and is `orgId` in the `WHERE`?
-- **The schema** — `SCHEMA`, `ADDED_COLUMNS`, `POST_MIGRATION_INDEXES`, and does
-  an existing row need backfilling the way `backfillInboundSlugs` does?
+- **The schema** — is it a new entry at the end of `MIGRATIONS`, and does an
+  existing row need backfilling the way `backfillInboundSlugs` does? Add the
+  before/after to `tests/migrations.test.mts` if a live database would notice.
 - **A Server Action** — does it re-resolve every client-supplied id against the
-  session's org before use?
+  session's org before use, and does a change worth remembering reach
+  `recordEvent`?
 - **Inbound routing or threading** — README "How tenant isolation works" (6) and
   the threading rules in [`src/lib/inbound.ts`](src/lib/inbound.ts).
 - **An environment variable** — `.env.local.example`, the matching README

@@ -9,11 +9,13 @@ import {
 import { listAgents } from "@/lib/agents";
 import { requireSession } from "@/lib/auth";
 import { listComments } from "@/lib/comments";
+import { listEvents } from "@/lib/events";
 import { formatDateTime, PRIORITY_LABELS, STATUS_LABELS } from "@/lib/format";
 import { getTicket, PRIORITIES, STATUSES } from "@/lib/tickets";
 import { PriorityBadge, StatusBadge } from "@/app/ui/Badge";
 
-import type { CommentType } from "@/lib/comments";
+import type { Comment, CommentType } from "@/lib/comments";
+import type { TicketEvent } from "@/lib/events";
 
 import { Composer } from "./Composer";
 import { InlineSelect } from "./InlineSelect";
@@ -29,6 +31,62 @@ const COMMENT_TONE: Record<CommentType, string> = {
   internal: "badge-amber",
   inbound: "badge-blue",
 };
+
+type TimelineEntry =
+  | { at: string; seq: number; kind: "comment"; comment: Comment }
+  | { at: string; seq: number; kind: "event"; event: TicketEvent };
+
+/**
+ * Comments and events are two tables with one chronology. `created_at` has
+ * second precision, so the row id breaks ties — a status change made in the
+ * same second as the reply that caused it still sorts after it.
+ */
+function buildTimeline(
+  comments: Comment[],
+  events: TicketEvent[],
+): TimelineEntry[] {
+  const entries: TimelineEntry[] = [
+    ...comments.map((comment) => ({
+      at: comment.created_at,
+      seq: comment.id,
+      kind: "comment" as const,
+      comment,
+    })),
+    ...events.map((event) => ({
+      at: event.created_at,
+      seq: event.id,
+      kind: "event" as const,
+      event,
+    })),
+  ];
+
+  return entries.sort((a, b) =>
+    a.at === b.at ? a.seq - b.seq : a.at.localeCompare(b.at),
+  );
+}
+
+/** Past tense, subject first — the timeline reads as a list of things that happened. */
+function describeEvent(event: TicketEvent): string {
+  const who = event.actor_agent_name ?? "The client";
+
+  switch (event.kind) {
+    case "created":
+      return event.actor_agent_name
+        ? `${who} opened this ticket`
+        : "Opened from an inbound email";
+    case "status_changed":
+      return `${who} changed status from ${label(STATUS_LABELS, event.from_value)} to ${label(STATUS_LABELS, event.to_value)}`;
+    case "priority_changed":
+      return `${who} changed priority from ${label(PRIORITY_LABELS, event.from_value)} to ${label(PRIORITY_LABELS, event.to_value)}`;
+    case "assignee_changed":
+      return `${who} changed the assignee from ${event.from_value} to ${event.to_value}`;
+  }
+}
+
+function label(labels: Record<string, string>, value: string | null): string {
+  if (!value) return "—";
+  return labels[value] ?? value;
+}
 
 export default async function TicketPage({
   params,
@@ -46,10 +104,13 @@ export default async function TicketPage({
   const ticket = await getTicket(session.orgId, ticketId);
   if (!ticket) notFound();
 
-  const [comments, agents] = await Promise.all([
+  const [comments, events, agents] = await Promise.all([
     listComments(session.orgId, ticketId),
+    listEvents(session.orgId, ticketId),
     listAgents(session.orgId),
   ]);
+
+  const timeline = buildTimeline(comments, events);
 
   return (
     <>
@@ -75,37 +136,48 @@ export default async function TicketPage({
 
           <div className="card card-pad">
             <div className="section-title">
-              Conversation
-              {comments.length > 0 ? ` · ${comments.length}` : ""}
+              Activity
+              {comments.length > 0
+                ? ` · ${comments.length} ${comments.length === 1 ? "message" : "messages"}`
+                : ""}
             </div>
 
-            {comments.length === 0 ? (
+            {timeline.length === 0 ? (
               <p className="muted">
                 Nothing here yet. Reply to the client or leave an internal note.
               </p>
             ) : (
               <div className="thread">
-                {comments.map((comment) => (
-                  <article
-                    key={comment.id}
-                    className={`comment comment-${comment.type}`}
-                  >
-                    <div className="comment-head">
-                      <span className="comment-author">
-                        {comment.type === "inbound"
-                          ? (comment.author_email ?? "Client")
-                          : (comment.agent_name ?? "Unknown")}
+                {timeline.map((entry) =>
+                  entry.kind === "comment" ? (
+                    <article
+                      key={`c${entry.comment.id}`}
+                      className={`comment comment-${entry.comment.type}`}
+                    >
+                      <div className="comment-head">
+                        <span className="comment-author">
+                          {entry.comment.type === "inbound"
+                            ? (entry.comment.author_email ?? "Client")
+                            : (entry.comment.agent_name ?? "Unknown")}
+                        </span>
+                        <span className={`badge ${COMMENT_TONE[entry.comment.type]}`}>
+                          {COMMENT_LABELS[entry.comment.type]}
+                        </span>
+                        <span className="comment-time">
+                          {formatDateTime(entry.comment.created_at)}
+                        </span>
+                      </div>
+                      <p className="comment-body">{entry.comment.body}</p>
+                    </article>
+                  ) : (
+                    <p className="event" key={`e${entry.event.id}`}>
+                      <span>{describeEvent(entry.event)}</span>
+                      <span className="event-time">
+                        {formatDateTime(entry.event.created_at)}
                       </span>
-                      <span className={`badge ${COMMENT_TONE[comment.type]}`}>
-                        {COMMENT_LABELS[comment.type]}
-                      </span>
-                      <span className="comment-time">
-                        {formatDateTime(comment.created_at)}
-                      </span>
-                    </div>
-                    <p className="comment-body">{comment.body}</p>
-                  </article>
-                ))}
+                    </p>
+                  ),
+                )}
               </div>
             )}
           </div>

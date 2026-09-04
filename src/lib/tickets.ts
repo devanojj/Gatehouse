@@ -1,8 +1,27 @@
 import "server-only";
 
-import { execute, insert, query, queryOne } from "./db";
+import { execute, executeCounting, insert, query, queryOne } from "./db";
+import { recordEvent } from "./events";
 
-export const STATUSES = ["open", "in-progress", "closed"] as const;
+/**
+ * The ticket lifecycle, in the order it is worked. `closed` is the end of the
+ * line; `resolved` is the state a customer reply can still come back from.
+ */
+export const STATUSES = [
+  "open",
+  "in_progress",
+  "pending_customer",
+  "resolved",
+  "closed",
+] as const;
+
+/** Statuses that mean somebody is still expected to do something. */
+export const ACTIVE_STATUSES = [
+  "open",
+  "in_progress",
+  "pending_customer",
+] as const;
+
 export const PRIORITIES = ["low", "medium", "high"] as const;
 
 export type Status = (typeof STATUSES)[number];
@@ -27,9 +46,16 @@ export type Ticket = {
   assigned_agent_id: number | null;
   assigned_agent_name: string | null;
   source_message_id: string | null;
+  /** Set when the ticket first reaches `resolved` or `closed`; cleared on reopen. */
+  resolved_at: string | null;
+  /** When an agent first replied publicly. Never overwritten. */
+  first_response_at: string | null;
   created_at: string;
   updated_at: string;
 };
+
+/** For inlining into SQL — the values come from ACTIVE_STATUSES, never a caller. */
+const ACTIVE_STATUS_LIST = ACTIVE_STATUSES.map((s) => `'${s}'`).join(", ");
 
 const SELECT_TICKET = `
   SELECT t.*, a.name AS assigned_agent_name
@@ -87,6 +113,12 @@ export async function getTicket(
   ]);
 }
 
+/**
+ * The opening event is written here rather than by the caller, so a ticket
+ * cannot reach the timeline without one — whether it came from the agent form,
+ * inbound mail, or anywhere added later. `actorAgentId` is null for a ticket
+ * the client raised.
+ */
 export async function createTicket(
   orgId: number,
   fields: {
@@ -95,9 +127,10 @@ export async function createTicket(
     priority: Priority;
     requesterEmail: string | null;
     sourceMessageId?: string | null;
+    actorAgentId?: number | null;
   },
 ): Promise<number> {
-  return insert(
+  const ticketId = await insert(
     `INSERT INTO tickets
        (org_id, subject, description, priority, requester_email, source_message_id)
      VALUES (?, ?, ?, ?, ?, ?)`,
@@ -110,6 +143,12 @@ export async function createTicket(
       fields.sourceMessageId ?? null,
     ],
   );
+
+  await recordEvent(orgId, ticketId, "created", {
+    actorAgentId: fields.actorAgentId ?? null,
+  });
+
+  return ticketId;
 }
 
 /**
@@ -125,23 +164,54 @@ export async function findOpenTicketByRequester(
     `${SELECT_TICKET}
       WHERE t.org_id = ?
         AND t.requester_email = ?
-        AND t.status IN ('open', 'in-progress')
+        AND t.status IN (${ACTIVE_STATUS_LIST})
       ORDER BY t.created_at DESC
       LIMIT 1`,
     [orgId, requesterEmail],
   );
 }
 
+/**
+ * `resolved_at` is maintained here rather than by the caller so it cannot drift
+ * from the status. Reaching `resolved` or `closed` stamps it once — a ticket
+ * closed after being resolved keeps the earlier time — and moving back to any
+ * active status clears it, so a reopened ticket is not counted as resolved.
+ */
 export async function updateStatus(
   orgId: number,
   ticketId: number,
   status: Status,
 ): Promise<void> {
   await execute(
-    `UPDATE tickets SET status = ?, updated_at = datetime('now')
+    `UPDATE tickets
+        SET status = ?,
+            resolved_at = CASE
+              WHEN ? IN ('resolved', 'closed')
+                THEN COALESCE(resolved_at, datetime('now'))
+              ELSE NULL
+            END,
+            updated_at = datetime('now')
       WHERE id = ? AND org_id = ?`,
-    [status, ticketId, orgId],
+    [status, status, ticketId, orgId],
   );
+}
+
+/**
+ * Stamps the first public reply. The `IS NULL` guard is in the statement, not
+ * in a read beforehand, so two agents replying at once still record one first
+ * response. Returns whether this call was the one that set it.
+ */
+export async function markFirstResponse(
+  orgId: number,
+  ticketId: number,
+): Promise<boolean> {
+  const rows = await executeCounting(
+    `UPDATE tickets SET first_response_at = datetime('now')
+      WHERE id = ? AND org_id = ? AND first_response_at IS NULL`,
+    [ticketId, orgId],
+  );
+
+  return rows > 0;
 }
 
 export async function updatePriority(

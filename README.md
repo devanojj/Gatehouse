@@ -33,14 +33,20 @@ Then start the dev server:
 npm run dev
 ```
 
+`npm test` runs the suite — tenant isolation, the ticket status model, and the
+migration runner — against throwaway SQLite files. No configuration needed.
+
 Open http://localhost:3000 and create a workspace at `/signup`. With no
 `RESEND_API_KEY` set, magic links are **printed to the server console** — copy
 the `/login/verify?token=…` URL out of your terminal to sign in. That is the
 entire login loop, with nothing else configured.
 
-Tables are created lazily on first request, so there is no migration step.
-Columns added after the first release are applied the same way: on connection,
-Gatehouse checks for them and runs `ALTER TABLE` if they are missing.
+The database brings itself up to date on the first request, so there is still no
+migration step to run by hand. Ordered migrations live in
+[`src/lib/migrations.ts`](src/lib/migrations.ts); each one is applied inside a
+write transaction together with the row recording it, so a half-applied
+migration cannot be mistaken for a finished one, and two instances booting at
+once cannot both apply the same change.
 
 ## Hosted database
 
@@ -60,8 +66,9 @@ turso db tokens create gatehouse
 
 Put them in `TURSO_DATABASE_URL` and `TURSO_AUTH_TOKEN`. Use a **fresh**
 database — Gatehouse's `tickets` and `comments` tables carry an `org_id` that a
-single-tenant schema won't have, and `CREATE TABLE IF NOT EXISTS` silently
-skips a conflicting table rather than fixing it.
+single-tenant schema won't have, and the baseline migration's
+`CREATE TABLE IF NOT EXISTS` silently skips a conflicting table rather than
+fixing it.
 
 ## Sending real email
 
@@ -159,8 +166,23 @@ src/
     login/  signup/   magic-link auth
     ui/               logo, badges, nav
   lib/                db, auth, email, and per-table data access
+    migrations.ts     ordered schema changes, applied on first use
   proxy.ts            optimistic cookie check
+tests/                node --test, one scratch database per file
 ```
+
+## The ticket lifecycle
+
+`open → in_progress → pending_customer → resolved → closed`. Reaching `resolved`
+or `closed` stamps `resolved_at`; moving back to any active status clears it, so
+a reopened ticket stops counting as resolved. `first_response_at` is stamped by
+the first public reply and never overwritten — an internal note does not stop
+that clock.
+
+Everything else that happens to a ticket — who changed the status, the priority,
+the assignee, and who opened it — is a row in `ticket_events`, rendered in the
+ticket's Activity list alongside the conversation. Transition *rules* (which
+moves are legal from which state) are not enforced yet.
 
 ## Deliberately not built
 

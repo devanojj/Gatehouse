@@ -22,9 +22,11 @@ export function formatDateTime(value: string): string {
 }
 
 export const STATUS_LABELS: Record<string, string> = {
-  "open": "Open",
-  "in-progress": "In progress",
-  "closed": "Closed",
+  open: "Open",
+  in_progress: "In progress",
+  pending_customer: "Waiting on client",
+  resolved: "Resolved",
+  closed: "Closed",
 };
 
 export const PRIORITY_LABELS: Record<string, string> = {

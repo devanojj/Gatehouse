@@ -2,9 +2,11 @@ import { PRIORITY_LABELS, STATUS_LABELS } from "@/lib/format";
 import type { Priority, Status } from "@/lib/tickets";
 
 const STATUS_TONE: Record<Status, string> = {
-  "open": "badge-amber",
-  "in-progress": "badge-blue",
-  "closed": "badge-gray",
+  open: "badge-amber",
+  in_progress: "badge-blue",
+  pending_customer: "badge-violet",
+  resolved: "badge-teal",
+  closed: "badge-gray",
 };
 
 const PRIORITY_TONE: Record<Priority, string> = {

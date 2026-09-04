@@ -1,7 +1,7 @@
 import "server-only";
 
-import { insert, queryOne, query, SLUG_ATTEMPTS } from "./db";
-import { newInboundSlug } from "./slug";
+import { insert, queryOne, query } from "./db";
+import { newInboundSlug, SLUG_ATTEMPTS } from "./slug";
 
 export type Agent = {
   id: number;

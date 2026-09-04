@@ -4,9 +4,11 @@
   "private": true,
   "scripts": {
     "dev": "next dev",
+    "dev:scratch": "TURSO_DATABASE_URL=file:./scratch.db next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "test": "node --conditions=react-server --import tsx --test tests/*.test.mts"
   },
   "dependencies": {
     "@libsql/client": "^0.17.4",
@@ -24,6 +26,7 @@
     "@types/react-dom": "^19",
     "eslint": "^9",
     "eslint-config-next": "16.3.3",
+    "tsx": "^4.23.13",
     "typescript": "^5"
   }
 }

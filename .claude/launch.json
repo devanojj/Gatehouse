@@ -4,7 +4,10 @@
     {
       "name": "gatehouse",
       "runtimeExecutable": "npm",
-      "runtimeArgs": ["run", "dev"],
+      "runtimeArgs": [
+        "run",
+        "dev:scratch"
+      ],
       "port": 3000,
       "autoPort": true
     }

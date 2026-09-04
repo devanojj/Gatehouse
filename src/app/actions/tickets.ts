@@ -5,6 +5,7 @@ import { revalidatePath } from "next/cache";
 
 import { requireSession } from "@/lib/auth";
 import { createComment, isAgentCommentType } from "@/lib/comments";
+import { recordEvent } from "@/lib/events";
 import { getOrganization } from "@/lib/orgs";
 import { sendTicketReply } from "@/lib/ticket-mail";
 import {
@@ -12,11 +13,15 @@ import {
   getTicket,
   isPriority,
   isStatus,
+  markFirstResponse,
   touchTicket,
   updateAssignee,
   updatePriority,
   updateStatus,
 } from "@/lib/tickets";
+
+/** What the timeline shows in place of an assignee's name. */
+const UNASSIGNED = "Unassigned";
 
 export type TicketFormState = {
   error?: string;
@@ -64,6 +69,7 @@ export async function createTicketAction(
     description: description || null,
     priority,
     requesterEmail: requesterEmail || null,
+    actorAgentId: session.agentId,
   });
 
   revalidatePath("/tickets");
@@ -71,29 +77,45 @@ export async function createTicketAction(
 }
 
 export async function setStatusAction(formData: FormData): Promise<void> {
-  const { session, ticketId } = await requireTicketAccess(formData);
+  const { session, ticket, ticketId } = await requireTicketAccess(formData);
   const status = formData.get("status");
 
   if (!isStatus(status)) throw new Error("Invalid status.");
 
+  // Re-selecting the value the ticket already has is not history.
+  if (status === ticket.status) return;
+
   await updateStatus(session.orgId, ticketId, status);
+  await recordEvent(session.orgId, ticketId, "status_changed", {
+    actorAgentId: session.agentId,
+    from: ticket.status,
+    to: status,
+  });
+
   revalidatePath(`/tickets/${ticketId}`);
   revalidatePath("/tickets");
 }
 
 export async function setPriorityAction(formData: FormData): Promise<void> {
-  const { session, ticketId } = await requireTicketAccess(formData);
+  const { session, ticket, ticketId } = await requireTicketAccess(formData);
   const priority = formData.get("priority");
 
   if (!isPriority(priority)) throw new Error("Invalid priority.");
+  if (priority === ticket.priority) return;
 
   await updatePriority(session.orgId, ticketId, priority);
+  await recordEvent(session.orgId, ticketId, "priority_changed", {
+    actorAgentId: session.agentId,
+    from: ticket.priority,
+    to: priority,
+  });
+
   revalidatePath(`/tickets/${ticketId}`);
   revalidatePath("/tickets");
 }
 
 export async function setAssigneeAction(formData: FormData): Promise<void> {
-  const { session, ticketId } = await requireTicketAccess(formData);
+  const { session, ticket, ticketId } = await requireTicketAccess(formData);
   const raw = String(formData.get("assignedAgentId") ?? "");
   const agentId = raw === "" ? null : Number(raw);
 
@@ -101,7 +123,20 @@ export async function setAssigneeAction(formData: FormData): Promise<void> {
     throw new Error("Invalid assignee.");
   }
 
+  if (agentId === ticket.assigned_agent_id) return;
+
   await updateAssignee(session.orgId, ticketId, agentId);
+
+  // Read the assignee back rather than trusting the submitted id: an agent from
+  // another tenant resolves to NULL in `updateAssignee`, and the timeline has to
+  // record what actually happened, not what was asked for.
+  const updated = await getTicket(session.orgId, ticketId);
+  await recordEvent(session.orgId, ticketId, "assignee_changed", {
+    actorAgentId: session.agentId,
+    from: ticket.assigned_agent_name ?? UNASSIGNED,
+    to: updated?.assigned_agent_name ?? UNASSIGNED,
+  });
+
   revalidatePath(`/tickets/${ticketId}`);
   revalidatePath("/tickets");
 }
@@ -122,6 +157,10 @@ export async function addCommentAction(
     authorEmail: session.agentEmail,
   });
   await touchTicket(session.orgId, ticketId);
+
+  // First response is measured from the first reply the client can see, so an
+  // internal note does not stop the clock.
+  if (type === "public") await markFirstResponse(session.orgId, ticketId);
 
   revalidatePath(`/tickets/${ticketId}`);
 
