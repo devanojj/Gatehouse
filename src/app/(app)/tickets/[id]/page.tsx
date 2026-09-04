@@ -2,8 +2,10 @@ import Link from "next/link";
 import { notFound } from "next/navigation";
 
 import {
+  claimTicketAction,
   setAssigneeAction,
   setPriorityAction,
+  setQueueAction,
   setStatusAction,
 } from "@/app/actions/tickets";
 import { listAgents } from "@/lib/agents";
@@ -11,7 +13,8 @@ import { requireSession } from "@/lib/auth";
 import { listComments } from "@/lib/comments";
 import { listEvents } from "@/lib/events";
 import { formatDateTime, PRIORITY_LABELS, STATUS_LABELS } from "@/lib/format";
-import { getTicket, PRIORITIES, STATUSES } from "@/lib/tickets";
+import { listQueues } from "@/lib/queues";
+import { allowedTransitions, getTicket, PRIORITIES } from "@/lib/tickets";
 import { PriorityBadge, StatusBadge } from "@/app/ui/Badge";
 
 import type { Comment, CommentType } from "@/lib/comments";
@@ -37,9 +40,11 @@ type TimelineEntry =
   | { at: string; seq: number; kind: "event"; event: TicketEvent };
 
 /**
- * Comments and events are two tables with one chronology. `created_at` has
- * second precision, so the row id breaks ties — a status change made in the
- * same second as the reply that caused it still sorts after it.
+ * Comments and events are two tables with one chronology, timestamped to the
+ * millisecond so they interleave truthfully. On an exact tie — or on rows
+ * written before millisecond timestamps — a comment reads before the events
+ * around it, since a change is usually a response to something said. Ids only
+ * break ties within one table, never across two.
  */
 function buildTimeline(
   comments: Comment[],
@@ -60,9 +65,13 @@ function buildTimeline(
     })),
   ];
 
-  return entries.sort((a, b) =>
-    a.at === b.at ? a.seq - b.seq : a.at.localeCompare(b.at),
-  );
+  const rank = (entry: TimelineEntry) => (entry.kind === "comment" ? 0 : 1);
+
+  return entries.sort((a, b) => {
+    if (a.at !== b.at) return a.at.localeCompare(b.at);
+    if (a.kind !== b.kind) return rank(a) - rank(b);
+    return a.seq - b.seq;
+  });
 }
 
 /** Past tense, subject first — the timeline reads as a list of things that happened. */
@@ -80,6 +89,8 @@ function describeEvent(event: TicketEvent): string {
       return `${who} changed priority from ${label(PRIORITY_LABELS, event.from_value)} to ${label(PRIORITY_LABELS, event.to_value)}`;
     case "assignee_changed":
       return `${who} changed the assignee from ${event.from_value} to ${event.to_value}`;
+    case "queue_changed":
+      return `${who} moved this ticket from ${event.from_value} to ${event.to_value}`;
   }
 }
 
@@ -104,13 +115,26 @@ export default async function TicketPage({
   const ticket = await getTicket(session.orgId, ticketId);
   if (!ticket) notFound();
 
-  const [comments, events, agents] = await Promise.all([
+  const [comments, events, agents, queues] = await Promise.all([
     listComments(session.orgId, ticketId),
     listEvents(session.orgId, ticketId),
     listAgents(session.orgId),
+    listQueues(session.orgId),
   ]);
 
   const timeline = buildTimeline(comments, events);
+
+  // A closed ticket is read-only. An owner can reopen it; nobody can edit it in
+  // place. The server enforces this too — this is what stops the controls from
+  // offering something that would only throw.
+  const locked = ticket.status === "closed";
+
+  // Only the moves the ticket can actually make from where it is now.
+  const statusOptions = locked
+    ? session.role === "owner"
+      ? (["closed", "open"] as const)
+      : (["closed"] as const)
+    : [ticket.status, ...allowedTransitions(ticket.status)];
 
   return (
     <>
@@ -182,10 +206,21 @@ export default async function TicketPage({
             )}
           </div>
 
-          <div className="card card-pad">
-            <div className="section-title">Add to the conversation</div>
-            <Composer ticketId={ticket.id} />
-          </div>
+          {locked ? (
+            <p className="locked-banner">
+              <strong>This ticket is closed.</strong>
+              <span>
+                {session.role === "owner"
+                  ? "Reopen it to add to the conversation."
+                  : "An owner can reopen it if there is more to do."}
+              </span>
+            </p>
+          ) : (
+            <div className="card card-pad">
+              <div className="section-title">Add to the conversation</div>
+              <Composer ticketId={ticket.id} />
+            </div>
+          )}
         </div>
 
         <aside>
@@ -197,10 +232,23 @@ export default async function TicketPage({
                 name="status"
                 ticketId={ticket.id}
                 value={ticket.status}
-                options={STATUSES.map((status) => ({
+                options={statusOptions.map((status) => ({
                   value: status,
                   label: STATUS_LABELS[status],
                 }))}
+              />
+
+              <InlineSelect
+                action={setQueueAction}
+                label="Queue"
+                name="queueId"
+                ticketId={ticket.id}
+                value={ticket.queue_id?.toString() ?? ""}
+                options={queues.map((queue) => ({
+                  value: String(queue.id),
+                  label: queue.name,
+                }))}
+                disabled={locked}
               />
 
               <InlineSelect
@@ -213,6 +261,7 @@ export default async function TicketPage({
                   value: priority,
                   label: PRIORITY_LABELS[priority],
                 }))}
+                disabled={locked}
               />
 
               <InlineSelect
@@ -228,7 +277,18 @@ export default async function TicketPage({
                     label: agent.name,
                   })),
                 ]}
+                disabled={locked}
               />
+
+              {!locked && ticket.assigned_agent_id === null ? (
+                <form action={claimTicketAction} className="claim-row">
+                  <input type="hidden" name="ticketId" value={ticket.id} />
+                  <button className="btn btn-secondary" type="submit">
+                    Claim this ticket
+                  </button>
+                  <span className="hint">Nobody owns it yet.</span>
+                </form>
+              ) : null}
             </div>
           </div>
 
@@ -246,6 +306,10 @@ export default async function TicketPage({
                 <dd>
                   <PriorityBadge priority={ticket.priority} />
                 </dd>
+              </div>
+              <div className="meta-row">
+                <dt>Queue</dt>
+                <dd>{ticket.queue_name ?? "—"}</dd>
               </div>
               <div className="meta-row">
                 <dt>Requester</dt>

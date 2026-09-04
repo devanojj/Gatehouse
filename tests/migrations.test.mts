@@ -141,6 +141,24 @@ test("a pre-migration database converges without losing rows", async () => {
 
   const events = await client.execute(`SELECT COUNT(*) AS n FROM ticket_events`);
   assert.equal(Number(events.rows[0].n), 0, "ticket_events should exist and be empty");
+
+  // Queues arrive after the rows do, so the migration has to invent the default
+  // and put every existing ticket in it.
+  const queues = await client.execute(
+    `SELECT id, name, is_default FROM queues WHERE org_id = 1`,
+  );
+  assert.equal(queues.rows.length, 1);
+  assert.equal(queues.rows[0].name, "General");
+  assert.equal(Number(queues.rows[0].is_default), 1);
+
+  const unrouted = await client.execute(
+    `SELECT COUNT(*) AS n FROM tickets WHERE queue_id IS NULL`,
+  );
+  assert.equal(
+    Number(unrouted.rows[0].n),
+    0,
+    "every existing ticket should have been put in the default queue",
+  );
 });
 
 test("a failing migration is rolled back and named", async () => {

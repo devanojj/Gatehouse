@@ -1,6 +1,7 @@
 import "server-only";
 
 import { createComment, messageAlreadyFiled } from "./comments";
+import { recordEvent } from "./events";
 import { inboundCredentials, type Organization } from "./orgs";
 import { slugFromAddress } from "./slug";
 import { ticketIdFromSubject } from "./ticket-mail";
@@ -9,6 +10,7 @@ import {
   findOpenTicketByRequester,
   getTicket,
   touchTicket,
+  updateStatus,
 } from "./tickets";
 
 /** One click never files more than this, so the action cannot run long. */
@@ -102,12 +104,15 @@ export async function fileMessage(
   }
 
   const referenced = ticketIdFromSubject(message.subject);
+  const marked = referenced ? await getTicket(org.id, referenced) : null;
 
   // A marker naming a ticket this org does not have — stale, or another
   // tenant's number — resolves to nothing and falls through to the sender's
-  // own thread rather than reaching across the boundary.
+  // own thread rather than reaching across the boundary. A marker naming a
+  // closed ticket is ignored the same way: a closed ticket is a finished
+  // record, so the reply opens a new one instead of reviving it.
   const existing =
-    (referenced ? await getTicket(org.id, referenced) : null) ??
+    (marked && marked.status !== "closed" ? marked : null) ??
     (await findOpenTicketByRequester(org.id, message.from));
 
   if (existing) {
@@ -116,6 +121,17 @@ export async function fileMessage(
       messageId: message.messageId,
     });
     await touchTicket(org.id, existing.id);
+
+    // A reply to something marked resolved means it was not. The client is the
+    // actor here, so the event carries no agent.
+    if (existing.status === "resolved") {
+      await updateStatus(org.id, existing.id, "open");
+      await recordEvent(org.id, existing.id, "status_changed", {
+        from: "resolved",
+        to: "open",
+      });
+    }
+
     return { outcome: "appended", ticketId: existing.id };
   }
 

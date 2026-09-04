@@ -1,6 +1,6 @@
 import "server-only";
 
-import { insert, query, queryOne } from "./db";
+import { insert, query, queryOne, TIMELINE_NOW } from "./db";
 
 /**
  * What an agent can post from the composer. Deliberately narrower than
@@ -61,8 +61,9 @@ export async function createComment(
 ): Promise<number> {
   return insert(
     `INSERT INTO comments
-       (org_id, ticket_id, agent_id, type, body, author_email, source_message_id)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+       (org_id, ticket_id, agent_id, type, body, author_email,
+        source_message_id, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ${TIMELINE_NOW})`,
     [
       orgId,
       ticketId,

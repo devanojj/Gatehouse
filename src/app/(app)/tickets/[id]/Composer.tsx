@@ -67,6 +67,13 @@ export function Composer({ ticketId }: { ticketId: number }) {
         }
       />
 
+      {type === "public" ? (
+        <label className="check-row">
+          <input type="checkbox" name="waitForReply" />
+          <span>Mark as waiting on client after sending</span>
+        </label>
+      ) : null}
+
       <div className="form-actions">
         <button className="btn btn-primary" type="submit" disabled={pending}>
           {pending

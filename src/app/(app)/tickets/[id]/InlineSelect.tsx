@@ -14,6 +14,7 @@ export function InlineSelect({
   ticketId,
   value,
   options,
+  disabled = false,
 }: {
   action: (formData: FormData) => Promise<void>;
   label: string;
@@ -21,6 +22,7 @@ export function InlineSelect({
   ticketId: number;
   value: string;
   options: { value: string; label: string }[];
+  disabled?: boolean;
 }) {
   const formRef = useRef<HTMLFormElement>(null);
   const [pending, startTransition] = useTransition();
@@ -39,7 +41,7 @@ export function InlineSelect({
         id={`${name}-${ticketId}`}
         name={name}
         defaultValue={value}
-        disabled={pending}
+        disabled={pending || disabled}
         onChange={(event) => {
           const form = event.currentTarget.form;
           if (form) startTransition(() => form.requestSubmit());
@@ -52,11 +54,13 @@ export function InlineSelect({
         ))}
       </select>
 
+      {disabled ? null : (
       <noscript>
         <button className="btn btn-secondary" type="submit" style={{ marginTop: 8 }}>
           Update {label.toLowerCase()}
         </button>
       </noscript>
+      )}
     </form>
   );
 }

@@ -6,22 +6,40 @@ import { revalidatePath } from "next/cache";
 import { requireSession } from "@/lib/auth";
 import { createComment, isAgentCommentType } from "@/lib/comments";
 import { recordEvent } from "@/lib/events";
+import { getQueue } from "@/lib/queues";
 import { getOrganization } from "@/lib/orgs";
 import { sendTicketReply } from "@/lib/ticket-mail";
 import {
+  canTransition,
+  claimTicket,
   createTicket,
   getTicket,
   isPriority,
   isStatus,
   markFirstResponse,
+  updateQueue,
   touchTicket,
   updateAssignee,
   updatePriority,
   updateStatus,
 } from "@/lib/tickets";
 
+import type { Ticket } from "@/lib/tickets";
+
 /** What the timeline shows in place of an assignee's name. */
 const UNASSIGNED = "Unassigned";
+
+const CLOSED_MESSAGE =
+  "This ticket is closed. An owner can reopen it before it is changed.";
+
+/**
+ * A closed ticket is a finished record: nothing about it changes until somebody
+ * with the authority reopens it. `setStatusAction` handles that one exception
+ * itself; every other write goes through here first.
+ */
+function assertMutable(ticket: Ticket): void {
+  if (ticket.status === "closed") throw new Error(CLOSED_MESSAGE);
+}
 
 export type TicketFormState = {
   error?: string;
@@ -85,6 +103,18 @@ export async function setStatusAction(formData: FormData): Promise<void> {
   // Re-selecting the value the ticket already has is not history.
   if (status === ticket.status) return;
 
+  // Reopening a closed ticket is the one change a closed ticket allows, and
+  // only an owner may make it.
+  if (ticket.status === "closed" && session.role !== "owner") {
+    throw new Error(CLOSED_MESSAGE);
+  }
+
+  if (!canTransition(ticket.status, status)) {
+    throw new Error(
+      `A ticket cannot move from ${ticket.status} to ${status}.`,
+    );
+  }
+
   await updateStatus(session.orgId, ticketId, status);
   await recordEvent(session.orgId, ticketId, "status_changed", {
     actorAgentId: session.agentId,
@@ -101,6 +131,7 @@ export async function setPriorityAction(formData: FormData): Promise<void> {
   const priority = formData.get("priority");
 
   if (!isPriority(priority)) throw new Error("Invalid priority.");
+  assertMutable(ticket);
   if (priority === ticket.priority) return;
 
   await updatePriority(session.orgId, ticketId, priority);
@@ -123,6 +154,7 @@ export async function setAssigneeAction(formData: FormData): Promise<void> {
     throw new Error("Invalid assignee.");
   }
 
+  assertMutable(ticket);
   if (agentId === ticket.assigned_agent_id) return;
 
   await updateAssignee(session.orgId, ticketId, agentId);
@@ -141,6 +173,58 @@ export async function setAssigneeAction(formData: FormData): Promise<void> {
   revalidatePath("/tickets");
 }
 
+export async function setQueueAction(formData: FormData): Promise<void> {
+  const { session, ticket, ticketId } = await requireTicketAccess(formData);
+  const queueId = Number(formData.get("queueId"));
+
+  if (!Number.isInteger(queueId) || queueId <= 0) {
+    throw new Error("Invalid queue.");
+  }
+
+  assertMutable(ticket);
+  if (queueId === ticket.queue_id) return;
+
+  // Resolved against this org before it is used for anything, including the
+  // name written to the timeline.
+  const queue = await getQueue(session.orgId, queueId);
+  if (!queue) throw new Error("Queue not found.");
+
+  await updateQueue(session.orgId, ticketId, queue.id);
+  await recordEvent(session.orgId, ticketId, "queue_changed", {
+    actorAgentId: session.agentId,
+    from: ticket.queue_name,
+    to: queue.name,
+  });
+
+  revalidatePath(`/tickets/${ticketId}`);
+  revalidatePath("/tickets");
+}
+
+/**
+ * Takes an unassigned ticket.
+ *
+ * Losing the race is not an error: the claim simply did not apply, and the
+ * revalidated page shows whoever did get it. Only the winner writes an event.
+ */
+export async function claimTicketAction(formData: FormData): Promise<void> {
+  const { session, ticket, ticketId } = await requireTicketAccess(formData);
+
+  assertMutable(ticket);
+
+  const claimed = await claimTicket(session.orgId, ticketId, session.agentId);
+
+  if (claimed) {
+    await recordEvent(session.orgId, ticketId, "assignee_changed", {
+      actorAgentId: session.agentId,
+      from: UNASSIGNED,
+      to: session.agentName,
+    });
+  }
+
+  revalidatePath(`/tickets/${ticketId}`);
+  revalidatePath("/tickets");
+}
+
 export async function addCommentAction(
   _prev: TicketFormState | undefined,
   formData: FormData,
@@ -152,6 +236,7 @@ export async function addCommentAction(
 
   if (!body) return { error: "Write something before posting." };
   if (!isAgentCommentType(type)) return { error: "Invalid comment type." };
+  if (ticket.status === "closed") return { error: CLOSED_MESSAGE };
 
   await createComment(session.orgId, ticketId, session.agentId, type, body, {
     authorEmail: session.agentEmail,
@@ -161,6 +246,24 @@ export async function addCommentAction(
   // First response is measured from the first reply the client can see, so an
   // internal note does not stop the clock.
   if (type === "public") await markFirstResponse(session.orgId, ticketId);
+
+  // "Send and wait for a reply" — one action rather than a reply followed by a
+  // separate status change nobody remembers to make.
+  const waitForReply = formData.get("waitForReply") === "on";
+
+  if (
+    waitForReply &&
+    type === "public" &&
+    canTransition(ticket.status, "pending_customer")
+  ) {
+    await updateStatus(session.orgId, ticketId, "pending_customer");
+    await recordEvent(session.orgId, ticketId, "status_changed", {
+      actorAgentId: session.agentId,
+      from: ticket.status,
+      to: "pending_customer",
+    });
+    revalidatePath("/tickets");
+  }
 
   revalidatePath(`/tickets/${ticketId}`);
 

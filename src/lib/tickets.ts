@@ -2,6 +2,7 @@ import "server-only";
 
 import { execute, executeCounting, insert, query, queryOne } from "./db";
 import { recordEvent } from "./events";
+import { ensureDefaultQueue } from "./queues";
 
 /**
  * The ticket lifecycle, in the order it is worked. `closed` is the end of the
@@ -22,7 +23,37 @@ export const ACTIVE_STATUSES = [
   "pending_customer",
 ] as const;
 
+/**
+ * Statuses a client's reply can still join. `resolved` is included — a reply
+ * to something marked resolved is exactly the case where the fix did not work,
+ * and it reopens the ticket. `closed` is not: a reply there starts a new one.
+ */
+export const REPLYABLE_STATUSES = [...ACTIVE_STATUSES, "resolved"] as const;
+
 export const PRIORITIES = ["low", "medium", "high"] as const;
+
+/**
+ * Which status may follow which. Everything active can reach any other active
+ * status or an end state; `closed` is the exception — the only way out is back
+ * to `open`, and only an owner may do it (enforced in the action, which is
+ * where the role is known).
+ */
+const TRANSITIONS: Record<Status, readonly Status[]> = {
+  open: ["in_progress", "pending_customer", "resolved", "closed"],
+  in_progress: ["open", "pending_customer", "resolved", "closed"],
+  pending_customer: ["open", "in_progress", "resolved", "closed"],
+  resolved: ["open", "in_progress", "pending_customer", "closed"],
+  closed: ["open"],
+};
+
+export function canTransition(from: Status, to: Status): boolean {
+  return TRANSITIONS[from].includes(to);
+}
+
+/** The statuses a ticket in this state can actually be moved to, for a select. */
+export function allowedTransitions(from: Status): readonly Status[] {
+  return TRANSITIONS[from];
+}
 
 export type Status = (typeof STATUSES)[number];
 export type Priority = (typeof PRIORITIES)[number];
@@ -45,6 +76,8 @@ export type Ticket = {
   requester_email: string | null;
   assigned_agent_id: number | null;
   assigned_agent_name: string | null;
+  queue_id: number | null;
+  queue_name: string | null;
   source_message_id: string | null;
   /** Set when the ticket first reaches `resolved` or `closed`; cleared on reopen. */
   resolved_at: string | null;
@@ -54,43 +87,81 @@ export type Ticket = {
   updated_at: string;
 };
 
-/** For inlining into SQL — the values come from ACTIVE_STATUSES, never a caller. */
-const ACTIVE_STATUS_LIST = ACTIVE_STATUSES.map((s) => `'${s}'`).join(", ");
+/** For inlining into SQL — the values come from the constant, never a caller. */
+const REPLYABLE_STATUS_LIST = REPLYABLE_STATUSES.map((s) => `'${s}'`).join(", ");
 
 const SELECT_TICKET = `
-  SELECT t.*, a.name AS assigned_agent_name
+  SELECT t.*, a.name AS assigned_agent_name, q.name AS queue_name
     FROM tickets t
     LEFT JOIN agents a
       ON a.id = t.assigned_agent_id
      AND a.org_id = t.org_id
+    LEFT JOIN queues q
+      ON q.id = t.queue_id
+     AND q.org_id = t.org_id
 `;
 
 /**
  * Every function in this module takes `orgId` as its first argument and puts it
  * in the WHERE clause. A ticket id on its own is never enough to reach a row.
  */
+export type TicketFilters = {
+  status?: Status;
+  queueId?: number;
+  assigneeId?: number;
+  /** Tickets nobody has picked up. Takes precedence over `assigneeId`. */
+  unassigned?: boolean;
+};
+
+/**
+ * Filters are optional and additive; `orgId` is not. Each one is a bound
+ * parameter appended to the same org-scoped WHERE, so no combination of them
+ * can widen the query past the tenant.
+ */
 export async function listTickets(
   orgId: number,
-  status?: Status,
+  filters: TicketFilters = {},
 ): Promise<Ticket[]> {
-  if (status) {
-    return query<Ticket>(
-      `${SELECT_TICKET} WHERE t.org_id = ? AND t.status = ? ORDER BY t.created_at DESC`,
-      [orgId, status],
-    );
+  const clauses = ["t.org_id = ?"];
+  const args: unknown[] = [orgId];
+
+  if (filters.status) {
+    clauses.push("t.status = ?");
+    args.push(filters.status);
   }
+
+  if (filters.queueId) {
+    clauses.push("t.queue_id = ?");
+    args.push(filters.queueId);
+  }
+
+  if (filters.unassigned) {
+    clauses.push("t.assigned_agent_id IS NULL");
+  } else if (filters.assigneeId) {
+    clauses.push("t.assigned_agent_id = ?");
+    args.push(filters.assigneeId);
+  }
+
   return query<Ticket>(
-    `${SELECT_TICKET} WHERE t.org_id = ? ORDER BY t.created_at DESC`,
-    [orgId],
+    `${SELECT_TICKET} WHERE ${clauses.join(" AND ")} ORDER BY t.created_at DESC`,
+    args,
   );
 }
 
+/**
+ * Counts for the status tabs. Takes the same queue filter the list does, so a
+ * tab never promises rows the current view would not show.
+ */
 export async function countTicketsByStatus(
   orgId: number,
+  queueId?: number,
 ): Promise<Record<string, number>> {
   const rows = await query<{ status: string; n: number }>(
-    `SELECT status, COUNT(*) AS n FROM tickets WHERE org_id = ? GROUP BY status`,
-    [orgId],
+    `SELECT status, COUNT(*) AS n
+       FROM tickets
+      WHERE org_id = ?${queueId ? " AND queue_id = ?" : ""}
+      GROUP BY status`,
+    queueId ? [orgId, queueId] : [orgId],
   );
 
   const counts: Record<string, number> = { all: 0 };
@@ -128,12 +199,21 @@ export async function createTicket(
     requesterEmail: string | null;
     sourceMessageId?: string | null;
     actorAgentId?: number | null;
+    /** Resolved against this org; anything else falls back to the default. */
+    queueId?: number | null;
   },
 ): Promise<number> {
+  // Every ticket lands in a queue, whether it came from the form, from mail, or
+  // from anywhere added later. The subquery scopes a supplied id to this org, so
+  // a foreign queue id becomes the default rather than a cross-tenant write.
+  const fallbackQueueId = await ensureDefaultQueue(orgId);
+
   const ticketId = await insert(
     `INSERT INTO tickets
-       (org_id, subject, description, priority, requester_email, source_message_id)
-     VALUES (?, ?, ?, ?, ?, ?)`,
+       (org_id, subject, description, priority, requester_email,
+        source_message_id, queue_id)
+     VALUES (?, ?, ?, ?, ?, ?,
+        COALESCE((SELECT id FROM queues WHERE id = ? AND org_id = ?), ?))`,
     [
       orgId,
       fields.subject,
@@ -141,6 +221,9 @@ export async function createTicket(
       fields.priority,
       fields.requesterEmail,
       fields.sourceMessageId ?? null,
+      fields.queueId ?? null,
+      orgId,
+      fallbackQueueId,
     ],
   );
 
@@ -153,7 +236,7 @@ export async function createTicket(
 
 /**
  * The fallback for a reply whose subject lost the `[Ticket #N]` marker: the
- * sender's most recent ticket that is still being worked on. Closed tickets are
+ * sender's most recent ticket that can still take one. Closed tickets are
  * excluded so a months-old thread is not reopened by a new question.
  */
 export async function findOpenTicketByRequester(
@@ -164,7 +247,7 @@ export async function findOpenTicketByRequester(
     `${SELECT_TICKET}
       WHERE t.org_id = ?
         AND t.requester_email = ?
-        AND t.status IN (${ACTIVE_STATUS_LIST})
+        AND t.status IN (${REPLYABLE_STATUS_LIST})
       ORDER BY t.created_at DESC
       LIMIT 1`,
     [orgId, requesterEmail],
@@ -244,6 +327,52 @@ export async function updateAssignee(
       WHERE id = ? AND org_id = ?`,
     [agentId, orgId, ticketId, orgId],
   );
+}
+
+/**
+ * Takes an unassigned ticket. The `IS NULL` test is part of the UPDATE rather
+ * than a read beforehand, so two agents pressing Claim at the same moment
+ * cannot both win: the database decides, and the loser is told.
+ */
+export async function claimTicket(
+  orgId: number,
+  ticketId: number,
+  agentId: number,
+): Promise<boolean> {
+  const rows = await executeCounting(
+    `UPDATE tickets
+        SET assigned_agent_id = (
+              SELECT id FROM agents WHERE id = ? AND org_id = ?
+            ),
+            updated_at = datetime('now')
+      WHERE id = ? AND org_id = ? AND assigned_agent_id IS NULL`,
+    [agentId, orgId, ticketId, orgId],
+  );
+
+  return rows > 0;
+}
+
+/**
+ * Moves a ticket between queues. Like `updateAssignee`, the target is resolved
+ * through a subquery scoped to the same org — a queue id from another tenant
+ * matches nothing, and the statement leaves the ticket where it was rather than
+ * writing a queue the org does not own.
+ */
+export async function updateQueue(
+  orgId: number,
+  ticketId: number,
+  queueId: number,
+): Promise<boolean> {
+  const rows = await executeCounting(
+    `UPDATE tickets
+        SET queue_id = (SELECT id FROM queues WHERE id = ? AND org_id = ?),
+            updated_at = datetime('now')
+      WHERE id = ? AND org_id = ?
+        AND EXISTS (SELECT 1 FROM queues WHERE id = ? AND org_id = ?)`,
+    [queueId, orgId, ticketId, orgId, queueId, orgId],
+  );
+
+  return rows > 0;
 }
 
 export async function touchTicket(

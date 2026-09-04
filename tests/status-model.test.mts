@@ -7,6 +7,7 @@ scratchDatabase();
 
 const { createOrganizationWithOwner } = await import("../src/lib/agents");
 const {
+  canTransition,
   createTicket,
   findOpenTicketByRequester,
   getTicket,
@@ -72,22 +73,42 @@ test("first response is recorded once and never overwritten", async () => {
   assert.equal((await getTicket(org.orgId, id))?.first_response_at, first);
 });
 
-test("inbound threading follows active statuses only", async () => {
+test("a reply can join any status except closed", async () => {
   const requester = "priya@client.test";
   const id = await newTicket(requester);
 
-  for (const status of ["open", "in_progress", "pending_customer"] as const) {
+  // `resolved` is included: a reply to something marked resolved is the case
+  // where the fix did not work, and it reopens the ticket.
+  for (const status of [
+    "open",
+    "in_progress",
+    "pending_customer",
+    "resolved",
+  ] as const) {
     await updateStatus(org.orgId, id, status);
     const found = await findOpenTicketByRequester(org.orgId, requester);
     assert.equal(found?.id, id, `${status} should still receive replies`);
   }
 
-  for (const status of ["resolved", "closed"] as const) {
-    await updateStatus(org.orgId, id, status);
+  await updateStatus(org.orgId, id, "closed");
+  assert.equal(
+    await findOpenTicketByRequester(org.orgId, requester),
+    null,
+    "a closed ticket should not be revived by a new message",
+  );
+});
+
+test("transitions allow every active move and lock closed down", async () => {
+  assert.equal(canTransition("open", "resolved"), true);
+  assert.equal(canTransition("resolved", "open"), true);
+  assert.equal(canTransition("pending_customer", "in_progress"), true);
+
+  assert.equal(canTransition("closed", "open"), true, "reopening is the way out");
+  for (const status of ["in_progress", "pending_customer", "resolved"] as const) {
     assert.equal(
-      await findOpenTicketByRequester(org.orgId, requester),
-      null,
-      `${status} should not silently swallow a new request`,
+      canTransition("closed", status),
+      false,
+      `closed should not move straight to ${status}`,
     );
   }
 });

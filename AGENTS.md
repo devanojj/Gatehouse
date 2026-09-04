@@ -108,8 +108,11 @@ database.
   existing row need backfilling the way `backfillInboundSlugs` does? Add the
   before/after to `tests/migrations.test.mts` if a live database would notice.
 - **A Server Action** — does it re-resolve every client-supplied id against the
-  session's org before use, and does a change worth remembering reach
-  `recordEvent`?
+  session's org before use, does a change worth remembering reach `recordEvent`,
+  and is it refused on a closed ticket?
+- **A control on the ticket page** — a closed ticket is read-only. Disable the
+  control as well as refusing the write, so the UI never offers something the
+  action will only throw on.
 - **Inbound routing or threading** — README "How tenant isolation works" (6) and
   the threading rules in [`src/lib/inbound.ts`](src/lib/inbound.ts).
 - **An environment variable** — `.env.local.example`, the matching README

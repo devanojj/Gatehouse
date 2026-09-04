@@ -31,7 +31,10 @@ export default async function AppLayout({
             <NavLink href="/tickets">Tickets</NavLink>
             <NavLink href="/settings/inbox">Inbox</NavLink>
             {session.role === "owner" ? (
-              <NavLink href="/settings/team">Team</NavLink>
+              <>
+                <NavLink href="/settings/queues">Queues</NavLink>
+                <NavLink href="/settings/team">Team</NavLink>
+              </>
             ) : null}
           </nav>
 

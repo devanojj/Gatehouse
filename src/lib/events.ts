@@ -1,6 +1,6 @@
 import "server-only";
 
-import { executeCounting, query } from "./db";
+import { executeCounting, query, TIMELINE_NOW } from "./db";
 
 /**
  * Everything that happens to a ticket other than the conversation itself.
@@ -11,6 +11,7 @@ export const EVENT_KINDS = [
   "status_changed",
   "priority_changed",
   "assignee_changed",
+  "queue_changed",
 ] as const;
 
 export type EventKind = (typeof EVENT_KINDS)[number];
@@ -59,8 +60,9 @@ export async function recordEvent(
 ): Promise<boolean> {
   const rows = await executeCounting(
     `INSERT INTO ticket_events
-       (org_id, ticket_id, actor_agent_id, kind, from_value, to_value)
-     SELECT ?, t.id, (SELECT id FROM agents WHERE id = ? AND org_id = ?), ?, ?, ?
+       (org_id, ticket_id, actor_agent_id, kind, from_value, to_value, created_at)
+     SELECT ?, t.id, (SELECT id FROM agents WHERE id = ? AND org_id = ?), ?, ?, ?,
+            ${TIMELINE_NOW}
        FROM tickets t
       WHERE t.id = ? AND t.org_id = ?`,
     [orgId, actorAgentId, orgId, kind, from, to, ticketId, orgId],

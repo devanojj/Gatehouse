@@ -191,6 +191,61 @@ export const MIGRATIONS: Migration[] = [
       ]);
     },
   },
+
+  {
+    // Queues: every ticket belongs to exactly one, and every org has a default
+    // for anything that has not been routed anywhere else.
+    name: "004_queues",
+    up: async (tx) => {
+      await run(tx, [
+        `CREATE TABLE IF NOT EXISTS queues (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          org_id INTEGER NOT NULL REFERENCES organizations(id),
+          name TEXT NOT NULL,
+          slug TEXT NOT NULL,
+          is_default INTEGER NOT NULL DEFAULT 0,
+          created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )`,
+        `CREATE UNIQUE INDEX IF NOT EXISTS idx_queues_org_slug
+           ON queues(org_id, slug)`,
+        `CREATE INDEX IF NOT EXISTS idx_queues_org
+           ON queues(org_id, name COLLATE NOCASE)`,
+        // At most one default per organization, enforced by the database rather
+        // than by whichever code path last wrote the flag.
+        `CREATE UNIQUE INDEX IF NOT EXISTS idx_queues_org_default
+           ON queues(org_id) WHERE is_default = 1`,
+      ]);
+
+      // SQLite cannot add a NOT NULL column to a populated table without
+      // rebuilding it, so the column is nullable here and `createTicket` is
+      // what guarantees every new row has one. Nothing reads a NULL queue after
+      // the backfill below.
+      await addColumn(tx, "tickets", "queue_id", "INTEGER REFERENCES queues(id)");
+
+      await tx.execute(
+        `INSERT INTO queues (org_id, name, slug, is_default)
+         SELECT o.id, 'General', 'general', 1
+           FROM organizations o
+          WHERE NOT EXISTS (
+                SELECT 1 FROM queues q WHERE q.org_id = o.id AND q.is_default = 1
+              )`,
+      );
+
+      await tx.execute(
+        `UPDATE tickets
+            SET queue_id = (
+                  SELECT q.id FROM queues q
+                   WHERE q.org_id = tickets.org_id AND q.is_default = 1
+                )
+          WHERE queue_id IS NULL`,
+      );
+
+      await tx.execute(
+        `CREATE INDEX IF NOT EXISTS idx_tickets_org_queue
+           ON tickets(org_id, queue_id, created_at DESC)`,
+      );
+    },
+  },
 ];
 
 /**

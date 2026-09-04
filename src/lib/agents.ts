@@ -1,6 +1,7 @@
 import "server-only";
 
 import { insert, queryOne, query } from "./db";
+import { ensureDefaultQueue } from "./queues";
 import { newInboundSlug, SLUG_ATTEMPTS } from "./slug";
 
 export type Agent = {
@@ -69,6 +70,9 @@ export async function createOrganizationWithOwner(
     `INSERT INTO agents (org_id, name, email, role) VALUES (?, ?, ?, 'owner')`,
     [orgId, agentName, normalizeEmail(email)],
   );
+
+  // A new workspace has somewhere to put its first ticket before it has one.
+  await ensureDefaultQueue(orgId);
 
   return { orgId, agentId };
 }

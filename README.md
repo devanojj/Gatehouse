@@ -33,8 +33,9 @@ Then start the dev server:
 npm run dev
 ```
 
-`npm test` runs the suite — tenant isolation, the ticket status model, and the
-migration runner — against throwaway SQLite files. No configuration needed.
+`npm test` runs the suite — tenant isolation, queues and claiming, the ticket
+status model, and the migration runner — against throwaway SQLite files. No
+configuration needed.
 
 Open http://localhost:3000 and create a workspace at `/signup`. With no
 `RESEND_API_KEY` set, magic links are **printed to the server console** — copy
@@ -171,18 +172,47 @@ src/
 tests/                node --test, one scratch database per file
 ```
 
+## Queues and ownership
+
+Every organization has one default queue — "General" until it is renamed — and
+every ticket belongs to exactly one queue and has at most one assignee. Owners
+manage queues under **Settings → Queues**: create, rename, choose the default,
+and delete. Deleting moves that queue's tickets to the default rather than
+orphaning them, and the default itself cannot be deleted.
+
+Agents move tickets between queues, assign them, or press **Claim this ticket**
+to take an unassigned one. Claiming is a conditional `UPDATE … WHERE
+assigned_agent_id IS NULL`, so two agents pressing it at the same moment cannot
+both win — the database decides, and the page shows whoever did.
+
+Queues group work; they do not restrict it. Every agent in an organization can
+see and work every ticket in it. Per-queue access is a later decision, not an
+omission.
+
 ## The ticket lifecycle
 
-`open → in_progress → pending_customer → resolved → closed`. Reaching `resolved`
-or `closed` stamps `resolved_at`; moving back to any active status clears it, so
-a reopened ticket stops counting as resolved. `first_response_at` is stamped by
-the first public reply and never overwritten — an internal note does not stop
-that clock.
+`open → in_progress → pending_customer → resolved → closed`. Any active status
+can reach any other, or either end state. `closed` is the exception: the only
+move out of it is back to `open`, and only an owner can make it. Until then a
+closed ticket is read-only — no replies, no reassignment, no queue change — and
+the controls that would fail are disabled rather than left to throw.
 
-Everything else that happens to a ticket — who changed the status, the priority,
-the assignee, and who opened it — is a row in `ticket_events`, rendered in the
-ticket's Activity list alongside the conversation. Transition *rules* (which
-moves are legal from which state) are not enforced yet.
+Reaching `resolved` or `closed` stamps `resolved_at`; moving back to any active
+status clears it, so a reopened ticket stops counting as resolved.
+`first_response_at` is stamped by the first public reply and never overwritten —
+an internal note does not stop that clock. Replying with **Mark as waiting on
+client** moves the ticket to `pending_customer` in the same action.
+
+A client's reply joins whatever ticket it belongs to, including a `resolved`
+one, which reopens it — a reply to something marked resolved is the case where
+the fix did not work. A reply to a `closed` ticket opens a new one instead;
+closed is final until a person says otherwise.
+
+Everything that happens to a ticket other than the conversation — who opened it,
+and every change of status, priority, assignee, or queue — is a row in
+`ticket_events`, rendered in the Activity list alongside the messages. Both
+tables are timestamped to the millisecond so the two interleave in the order
+they actually happened.
 
 ## Deliberately not built
 

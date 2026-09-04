@@ -64,6 +64,17 @@ function describeTarget(): string {
   return url.startsWith("file:") ? url : url.split("?")[0];
 }
 
+/**
+ * Timestamp for rows that share one chronology.
+ *
+ * `datetime('now')` only resolves to the second, which is not enough for a
+ * timeline built from two tables: a reply and the status change it caused land
+ * in the same second, and nothing in the data says which came first. The `%f`
+ * form keeps milliseconds, stays fixed-width so it still sorts as a string, and
+ * still parses in `format.ts`.
+ */
+export const TIMELINE_NOW = `strftime('%Y-%m-%d %H:%M:%f', 'now')`;
+
 export type Row = Record<string, unknown>;
 
 export async function query<T = Row>(
