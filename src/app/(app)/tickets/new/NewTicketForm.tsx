@@ -7,11 +7,7 @@ import { createTicketAction, type TicketFormState } from "@/app/actions/tickets"
 
 const initial: TicketFormState = {};
 
-export function NewTicketForm({
-  queues,
-}: {
-  queues: { id: number; name: string }[];
-}) {
+export function NewTicketForm() {
   const [state, action, pending] = useActionState(createTicketAction, initial);
 
   return (
@@ -54,21 +50,6 @@ export function NewTicketForm({
           </select>
         </div>
       </div>
-
-      {queues.length > 0 ? (
-        <div className="field">
-          <label htmlFor="queueId">Queue</label>
-          <select id="queueId" name="queueId" defaultValue="">
-            <option value="">No queue</option>
-            {queues.map((queue) => (
-              <option key={queue.id} value={String(queue.id)}>
-                {queue.name}
-              </option>
-            ))}
-          </select>
-          <p className="hint">Which team should pick this up. Optional.</p>
-        </div>
-      ) : null}
 
       <div className="field">
         <label htmlFor="description">Description</label>

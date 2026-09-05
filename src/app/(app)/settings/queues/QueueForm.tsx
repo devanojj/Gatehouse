@@ -2,90 +2,51 @@
 
 import { useActionState, useEffect, useRef } from "react";
 
-import {
-  createQueueAction,
-  renameQueueAction,
-  type QueueFormState,
-} from "@/app/actions/queues";
+import { createQueueAction, type QueueFormState } from "@/app/actions/queues";
 
 const initial: QueueFormState = {};
 
-/**
- * One form for both jobs: with a `queue` it renames that queue, without one it
- * creates a new one. Only plain props cross the boundary — the id is echoed
- * back to the action, which re-resolves it inside the caller's organization.
- */
-export function QueueForm({
-  queue,
-}: {
-  queue?: { id: number; name: string; description: string | null };
-}) {
-  const [state, action, pending] = useActionState(
-    queue ? renameQueueAction : createQueueAction,
-    initial,
-  );
+export function QueueForm() {
+  const [state, action, pending] = useActionState(createQueueAction, initial);
   const formRef = useRef<HTMLFormElement>(null);
 
   useEffect(() => {
-    if (!queue && state.saved) formRef.current?.reset();
-  }, [queue, state.saved]);
+    if (!pending && state.notice) formRef.current?.reset();
+  }, [state, pending]);
 
   return (
     <form ref={formRef} action={action}>
-      {queue ? <input type="hidden" name="queueId" value={queue.id} /> : null}
-
       {state.error ? (
         <p className="notice notice-error" role="alert">
           {state.error}
         </p>
       ) : null}
 
-      {state.saved ? (
+      {state.notice ? (
         <p className="notice notice-ok" role="status">
-          {state.saved}
+          {state.notice}
         </p>
       ) : null}
 
-      <div className="inline-form">
-        <div className="field">
-          <label className="label" htmlFor={`queue-name-${queue?.id ?? "new"}`}>
-            Name
-          </label>
-          <input
-            id={`queue-name-${queue?.id ?? "new"}`}
-            name="name"
-            type="text"
-            required
-            defaultValue={queue?.name ?? ""}
-            placeholder="Billing"
-          />
-        </div>
+      <label className="label" htmlFor="queue-name">
+        Queue name
+      </label>
+      <input
+        id="queue-name"
+        name="name"
+        required
+        maxLength={60}
+        placeholder="Billing"
+      />
+      <p className="hint">
+        Agents route tickets here by hand. Rules that route them automatically
+        come later.
+      </p>
 
-        <div className="field">
-          <label
-            className="label"
-            htmlFor={`queue-description-${queue?.id ?? "new"}`}
-          >
-            Description <span className="label-optional">optional</span>
-          </label>
-          <input
-            id={`queue-description-${queue?.id ?? "new"}`}
-            name="description"
-            type="text"
-            defaultValue={queue?.description ?? ""}
-            placeholder="Invoices, refunds and renewals"
-          />
-        </div>
-
-        <div className="form-actions">
-          <button
-            className={queue ? "btn btn-secondary" : "btn btn-primary"}
-            type="submit"
-            disabled={pending}
-          >
-            {pending ? "Saving…" : queue ? "Save" : "Create queue"}
-          </button>
-        </div>
+      <div className="form-actions">
+        <button className="btn btn-primary" type="submit" disabled={pending}>
+          {pending ? "Creating…" : "Create queue"}
+        </button>
       </div>
     </form>
   );

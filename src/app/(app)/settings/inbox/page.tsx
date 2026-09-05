@@ -22,9 +22,12 @@ export default async function InboxSettingsPage() {
 
   const address = inboundAddressFor(org);
   const configured = inboundCredentials() !== null;
-  // Whether this deployment can run the scheduled poll at all. The secret
-  // itself never reaches the page — only whether one is set.
-  const scheduled = Boolean(process.env.CRON_SECRET?.trim());
+
+  // The portal has no host of its own yet, so the link is built from APP_URL —
+  // the same variable the magic links in outbound mail use.
+  const portalUrl = org.portal_slug
+    ? `${(process.env.APP_URL ?? "http://localhost:3000").replace(/\/$/, "")}/o/${org.portal_slug}`
+    : null;
 
   return (
     <>
@@ -36,6 +39,25 @@ export default async function InboxSettingsPage() {
             tickets here.
           </p>
         </div>
+      </div>
+
+      <div className="card card-pad">
+        <div className="section-title">Your support portal</div>
+
+        {portalUrl ? (
+          <>
+            <p className="muted" style={{ marginBottom: 16 }}>
+              Customers raise requests here and follow them without an account —
+              they sign in with a link sent to the address they wrote from.
+            </p>
+            <InboundAddress address={portalUrl} />
+          </>
+        ) : (
+          <p className="notice notice-info">
+            This workspace has no portal address yet. Reload the page — one is
+            generated automatically.
+          </p>
+        )}
       </div>
 
       <div className="card card-pad">
@@ -110,9 +132,9 @@ export default async function InboxSettingsPage() {
       <div className="card card-pad">
         <div className="section-title">Fetch mail</div>
         <p className="muted" style={{ marginBottom: 20 }}>
-          {scheduled
-            ? "Mail is collected on a schedule, and you can pull it in now as well. Only messages addressed to your workspace are read; the rest are left untouched."
-            : "Mail is collected when you ask for it — this server has no schedule set up. Only messages addressed to your workspace are read; the rest are left untouched."}
+          Gatehouse does not poll on a schedule yet — mail is collected when you
+          ask for it. Only messages addressed to your workspace are read; the
+          rest are left untouched.
         </p>
         <CheckMailButton disabled={!configured || !address} />
 
@@ -122,34 +144,6 @@ export default async function InboxSettingsPage() {
             set on the server.
           </p>
         ) : null}
-
-        {configured && !scheduled ? (
-          <p className="hint" style={{ marginTop: 12 }}>
-            Set CRON_SECRET on the server to let the scheduled poll run on a
-            schedule.
-          </p>
-        ) : null}
-      </div>
-
-      <div className="card card-pad">
-        <div className="section-title">How a reply is handled</div>
-        <ul className="steps">
-          <li>
-            HTML-only mail is converted to readable text, and the quoted history
-            a mail client staples underneath a reply is trimmed off. When the
-            trimming is unsure, the whole message is kept.
-          </li>
-          <li>
-            A reply to a ticket that is <strong>waiting on customer</strong> or{" "}
-            <strong>resolved</strong> reopens it, so it comes back into the open
-            views.
-          </li>
-          <li>
-            A reply to a <strong>closed</strong> ticket is filed on it without
-            reopening — closing is the deliberate end of a conversation. Reopen
-            it by hand if the thread should carry on.
-          </li>
-        </ul>
       </div>
 
       <div className="card card-pad">
@@ -160,10 +154,12 @@ export default async function InboxSettingsPage() {
             on the tagged address above being kept private to your forwarding
             rule.
           </li>
+          <li>Attachments are not saved, and HTML-only mail arrives unformatted.</li>
           <li>
-            Attachments on inbound mail are not saved. Agents can attach files
-            to a ticket from the composer.
+            Quoted text from earlier replies is kept as sent, so threads can get
+            long.
           </li>
+          <li>A reply to a closed ticket is attached to it without reopening it.</li>
         </ul>
       </div>
     </>

@@ -5,29 +5,21 @@ import {
   claimTicketAction,
   setAssigneeAction,
   setPriorityAction,
+  setQueueAction,
   setStatusAction,
-  setTicketQueueAction,
 } from "@/app/actions/tickets";
 import { listAgents } from "@/lib/agents";
-import {
-  ALLOWED_EXTENSIONS,
-  formatBytes,
-  listTicketAttachments,
-  MAX_ATTACHMENT_BYTES,
-  MAX_ATTACHMENTS_PER_POST,
-  type Attachment,
-} from "@/lib/attachments";
 import { requireSession } from "@/lib/auth";
 import { listComments } from "@/lib/comments";
+import { listEvents } from "@/lib/events";
 import { formatDateTime, PRIORITY_LABELS, STATUS_LABELS } from "@/lib/format";
-import { applyMacro, listMacros } from "@/lib/macros";
-import { getOrganization } from "@/lib/orgs";
 import { listQueues } from "@/lib/queues";
-import { listTicketEvents, type TicketEvent } from "@/lib/ticket-events";
-import { getTicket, PRIORITIES, STATUSES } from "@/lib/tickets";
+import { allowedTransitions, getTicket, PRIORITIES } from "@/lib/tickets";
+import { evaluateTicketSla } from "@/lib/sla";
 import { PriorityBadge, StatusBadge } from "@/app/ui/Badge";
 
 import type { Comment, CommentType } from "@/lib/comments";
+import type { TicketEvent } from "@/lib/events";
 
 import { Composer } from "./Composer";
 import { InlineSelect } from "./InlineSelect";
@@ -44,10 +36,77 @@ const COMMENT_TONE: Record<CommentType, string> = {
   inbound: "badge-blue",
 };
 
-/** Comments and activity events, interleaved by the clock. */
 type TimelineEntry =
-  | { kind: "comment"; at: string; id: number; comment: Comment }
-  | { kind: "event"; at: string; id: number; event: TicketEvent };
+  | { at: string; seq: number; kind: "comment"; comment: Comment }
+  | { at: string; seq: number; kind: "event"; event: TicketEvent };
+
+/**
+ * Comments and events are two tables with one chronology, timestamped to the
+ * millisecond so they interleave truthfully. On an exact tie — or on rows
+ * written before millisecond timestamps — a comment reads before the events
+ * around it, since a change is usually a response to something said. Ids only
+ * break ties within one table, never across two.
+ */
+function buildTimeline(
+  comments: Comment[],
+  events: TicketEvent[],
+): TimelineEntry[] {
+  const entries: TimelineEntry[] = [
+    ...comments.map((comment) => ({
+      at: comment.created_at,
+      seq: comment.id,
+      kind: "comment" as const,
+      comment,
+    })),
+    ...events.map((event) => ({
+      at: event.created_at,
+      seq: event.id,
+      kind: "event" as const,
+      event,
+    })),
+  ];
+
+  const rank = (entry: TimelineEntry) => (entry.kind === "comment" ? 0 : 1);
+
+  return entries.sort((a, b) => {
+    if (a.at !== b.at) return a.at.localeCompare(b.at);
+    if (a.kind !== b.kind) return rank(a) - rank(b);
+    return a.seq - b.seq;
+  });
+}
+
+/** Past tense, subject first — the timeline reads as a list of things that happened. */
+function describeEvent(event: TicketEvent): string {
+  const who = event.actor_agent_name ?? "The client";
+
+  switch (event.kind) {
+    case "created":
+      if (event.actor_agent_name) return `${who} opened this ticket`;
+      // Tickets opened before the source was recorded carry no value here.
+      return event.to_value === "portal"
+        ? "Opened by the client from the support portal"
+        : "Opened from an inbound email";
+    case "status_changed":
+      return `${who} changed status from ${label(STATUS_LABELS, event.from_value)} to ${label(STATUS_LABELS, event.to_value)}`;
+    case "priority_changed":
+      return `${who} changed priority from ${label(PRIORITY_LABELS, event.from_value)} to ${label(PRIORITY_LABELS, event.to_value)}`;
+    case "assignee_changed":
+      return `${who} changed the assignee from ${event.from_value} to ${event.to_value}`;
+    case "queue_changed":
+      return `${who} moved this ticket from ${event.from_value} to ${event.to_value}`;
+    case "sla_breached":
+      return `SLA deadline breached: ${event.to_value ?? "Target missed"}`;
+    case "sla_warning":
+      return `SLA alert: ${event.to_value ?? "Approaching deadline"}`;
+    case "rule_applied":
+      return `Routing rule applied: ${event.to_value ?? "Automated triage"}`;
+  }
+}
+
+function label(labels: Record<string, string>, value: string | null): string {
+  if (!value) return "—";
+  return labels[value] ?? value;
+}
 
 export default async function TicketPage({
   params,
@@ -65,64 +124,27 @@ export default async function TicketPage({
   const ticket = await getTicket(session.orgId, ticketId);
   if (!ticket) notFound();
 
-  const [comments, events, agents, queues, macros, attachments, org] =
-    await Promise.all([
-      listComments(session.orgId, ticketId),
-      listTicketEvents(session.orgId, ticketId),
-      listAgents(session.orgId),
-      listQueues(session.orgId),
-      listMacros(session.orgId),
-      listTicketAttachments(session.orgId, ticketId),
-      getOrganization(session.orgId),
-    ]);
+  const [comments, events, agents, queues] = await Promise.all([
+    listComments(session.orgId, ticketId),
+    listEvents(session.orgId, ticketId),
+    listAgents(session.orgId),
+    listQueues(session.orgId),
+  ]);
 
-  const timeline: TimelineEntry[] = [
-    ...comments.map((comment) => ({
-      kind: "comment" as const,
-      at: comment.created_at,
-      id: comment.id,
-      comment,
-    })),
-    ...events.map((event) => ({
-      kind: "event" as const,
-      at: event.created_at,
-      id: event.id,
-      event,
-    })),
-  ].sort(
-    (a, b) =>
-      a.at.localeCompare(b.at) ||
-      // A change made alongside a reply reads better after it.
-      (a.kind === b.kind ? a.id - b.id : a.kind === "comment" ? -1 : 1),
-  );
+  const timeline = buildTimeline(comments, events);
 
-  const byComment = new Map<number, Attachment[]>();
-  const ticketAttachments: Attachment[] = [];
-  for (const attachment of attachments) {
-    if (attachment.comment_id === null) {
-      ticketAttachments.push(attachment);
-      continue;
-    }
-    const existing = byComment.get(attachment.comment_id) ?? [];
-    existing.push(attachment);
-    byComment.set(attachment.comment_id, existing);
-  }
+  // A closed ticket is read-only. An owner can reopen it; nobody can edit it in
+  // place. The server enforces this too — this is what stops the controls from
+  // offering something that would only throw.
+  const locked = ticket.status === "closed";
+  const sla = evaluateTicketSla(ticket);
 
-  // Macros are filled in here, on the server, so the composer receives plain
-  // strings and never has to know what a ticket or an organization is.
-  const composerMacros = macros.map((macro) => ({
-    id: macro.id,
-    name: macro.name,
-    body: applyMacro(macro.body, {
-      ticketNumber: ticket.id,
-      ticketSubject: ticket.subject,
-      requesterEmail: ticket.requester_email,
-      agentName: session.agentName,
-      orgName: org?.name ?? session.orgName,
-    }),
-  }));
-
-  const mine = ticket.assigned_agent_id === session.agentId;
+  // Only the moves the ticket can actually make from where it is now.
+  const statusOptions = locked
+    ? session.role === "owner"
+      ? (["closed", "open"] as const)
+      : (["closed"] as const)
+    : [ticket.status, ...allowedTransitions(ticket.status)];
 
   return (
     <>
@@ -144,13 +166,14 @@ export default async function TicketPage({
             ) : (
               <p className="muted">No description was given.</p>
             )}
-            <AttachmentList attachments={ticketAttachments} />
           </div>
 
           <div className="card card-pad">
             <div className="section-title">
-              Conversation
-              {comments.length > 0 ? ` · ${comments.length}` : ""}
+              Activity
+              {comments.length > 0
+                ? ` · ${comments.length} ${comments.length === 1 ? "message" : "messages"}`
+                : ""}
             </div>
 
             {timeline.length === 0 ? (
@@ -162,7 +185,7 @@ export default async function TicketPage({
                 {timeline.map((entry) =>
                   entry.kind === "comment" ? (
                     <article
-                      key={`comment-${entry.id}`}
+                      key={`c${entry.comment.id}`}
                       className={`comment comment-${entry.comment.type}`}
                     >
                       <div className="comment-head">
@@ -171,26 +194,19 @@ export default async function TicketPage({
                             ? (entry.comment.author_email ?? "Client")
                             : (entry.comment.agent_name ?? "Unknown")}
                         </span>
-                        <span
-                          className={`badge ${COMMENT_TONE[entry.comment.type]}`}
-                        >
+                        <span className={`badge ${COMMENT_TONE[entry.comment.type]}`}>
                           {COMMENT_LABELS[entry.comment.type]}
                         </span>
                         <span className="comment-time">
                           {formatDateTime(entry.comment.created_at)}
                         </span>
                       </div>
-                      {entry.comment.body ? (
-                        <p className="comment-body">{entry.comment.body}</p>
-                      ) : null}
-                      <AttachmentList
-                        attachments={byComment.get(entry.id) ?? []}
-                      />
+                      <p className="comment-body">{entry.comment.body}</p>
                     </article>
                   ) : (
-                    <p className="system-note" key={`event-${entry.id}`}>
+                    <p className="event" key={`e${entry.event.id}`}>
                       <span>{describeEvent(entry.event)}</span>
-                      <span className="system-note-time">
+                      <span className="event-time">
                         {formatDateTime(entry.event.created_at)}
                       </span>
                     </p>
@@ -200,44 +216,49 @@ export default async function TicketPage({
             )}
           </div>
 
-          <div className="card card-pad">
-            <div className="section-title">Add to the conversation</div>
-            <Composer
-              ticketId={ticket.id}
-              macros={composerMacros}
-              accept={ALLOWED_EXTENSIONS.map((ext) => `.${ext}`).join(",")}
-              maxFiles={MAX_ATTACHMENTS_PER_POST}
-              maxFileSize={formatBytes(MAX_ATTACHMENT_BYTES)}
-            />
-          </div>
+          {locked ? (
+            <p className="locked-banner">
+              <strong>This ticket is closed.</strong>
+              <span>
+                {session.role === "owner"
+                  ? "Reopen it to add to the conversation."
+                  : "An owner can reopen it if there is more to do."}
+              </span>
+            </p>
+          ) : (
+            <div className="card card-pad">
+              <div className="section-title">Add to the conversation</div>
+              <Composer ticketId={ticket.id} />
+            </div>
+          )}
         </div>
 
         <aside>
           <div className="card card-pad">
             <div className="control-stack">
-              {!mine ? (
-                <form action={claimTicketAction}>
-                  <input type="hidden" name="ticketId" value={ticket.id} />
-                  <button className="btn btn-secondary" type="submit">
-                    Take it
-                  </button>
-                </form>
-              ) : (
-                <p className="hint" style={{ marginTop: 0 }}>
-                  Assigned to you.
-                </p>
-              )}
-
               <InlineSelect
                 action={setStatusAction}
                 label="Status"
                 name="status"
                 ticketId={ticket.id}
                 value={ticket.status}
-                options={STATUSES.map((status) => ({
+                options={statusOptions.map((status) => ({
                   value: status,
                   label: STATUS_LABELS[status],
                 }))}
+              />
+
+              <InlineSelect
+                action={setQueueAction}
+                label="Queue"
+                name="queueId"
+                ticketId={ticket.id}
+                value={ticket.queue_id?.toString() ?? ""}
+                options={queues.map((queue) => ({
+                  value: String(queue.id),
+                  label: queue.name,
+                }))}
+                disabled={locked}
               />
 
               <InlineSelect
@@ -250,6 +271,7 @@ export default async function TicketPage({
                   value: priority,
                   label: PRIORITY_LABELS[priority],
                 }))}
+                disabled={locked}
               />
 
               <InlineSelect
@@ -265,30 +287,19 @@ export default async function TicketPage({
                     label: agent.name,
                   })),
                 ]}
+                disabled={locked}
               />
 
-              <InlineSelect
-                action={setTicketQueueAction}
-                label="Queue"
-                name="queueId"
-                ticketId={ticket.id}
-                value={ticket.queue_id?.toString() ?? ""}
-                options={[
-                  { value: "", label: "No queue" },
-                  ...queues.map((queue) => ({
-                    value: String(queue.id),
-                    label: queue.name,
-                  })),
-                ]}
-              />
+              {!locked && ticket.assigned_agent_id === null ? (
+                <form action={claimTicketAction} className="claim-row">
+                  <input type="hidden" name="ticketId" value={ticket.id} />
+                  <button className="btn btn-secondary" type="submit">
+                    Claim this ticket
+                  </button>
+                  <span className="hint">Nobody owns it yet.</span>
+                </form>
+              ) : null}
             </div>
-
-            {queues.length === 0 && session.role === "owner" ? (
-              <p className="hint">
-                <Link href="/settings/queues">Create a queue</Link> to route
-                tickets to a team.
-              </p>
-            ) : null}
           </div>
 
           <div className="card card-pad">
@@ -324,77 +335,52 @@ export default async function TicketPage({
               </div>
             </dl>
           </div>
+
+          <div className="card card-pad">
+            <div className="section-title">SLA Performance</div>
+            <dl>
+              <div className="meta-row">
+                <dt>First Response</dt>
+                <dd>
+                  {sla.firstResponse.status === "fulfilled" ? (
+                    <span className="badge badge-teal">Fulfilled</span>
+                  ) : sla.firstResponse.status === "breached" ? (
+                    <span className="badge badge-red">Breached</span>
+                  ) : sla.firstResponse.dueAt ? (
+                    <span
+                      className="badge badge-amber"
+                      title={`Due by ${formatDateTime(sla.firstResponse.dueAt)}`}
+                    >
+                      Pending
+                    </span>
+                  ) : (
+                    <span className="muted">—</span>
+                  )}
+                </dd>
+              </div>
+              <div className="meta-row">
+                <dt>Resolution</dt>
+                <dd>
+                  {sla.resolution.status === "fulfilled" ? (
+                    <span className="badge badge-teal">Fulfilled</span>
+                  ) : sla.resolution.status === "breached" ? (
+                    <span className="badge badge-red">Breached</span>
+                  ) : sla.resolution.dueAt ? (
+                    <span
+                      className="badge badge-blue"
+                      title={`Due by ${formatDateTime(sla.resolution.dueAt)}`}
+                    >
+                      Pending
+                    </span>
+                  ) : (
+                    <span className="muted">—</span>
+                  )}
+                </dd>
+              </div>
+            </dl>
+          </div>
         </aside>
       </div>
     </>
   );
-}
-
-/**
- * Attachments are linked by id alone. The bytes come back from
- * `/api/attachments/[id]`, which resolves the id inside the caller's own
- * organization before it returns anything — the storage key never leaves the
- * server.
- */
-function AttachmentList({ attachments }: { attachments: Attachment[] }) {
-  if (attachments.length === 0) return null;
-
-  return (
-    <div className="attachments">
-      {attachments.map((attachment) => (
-        <a
-          key={attachment.id}
-          className="attachment"
-          href={`/api/attachments/${attachment.id}`}
-        >
-          <span className="attachment-name">{attachment.filename}</span>
-          <span className="attachment-size">
-            {formatBytes(attachment.size_bytes)}
-          </span>
-        </a>
-      ))}
-    </div>
-  );
-}
-
-/**
- * A system notice for one activity event.
- *
- * Values were stored as display text when the event was written, inside the
- * organization it belongs to, so nothing here joins back out to another table
- * and no id is ever shown.
- */
-function describeEvent(event: TicketEvent): string {
-  const who = event.agent_name ?? "Gatehouse";
-  const status = (value: string | null) =>
-    value ? (STATUS_LABELS[value] ?? value) : "none";
-  const priority = (value: string | null) =>
-    value ? (PRIORITY_LABELS[value] ?? value) : "none";
-
-  switch (event.type) {
-    case "created":
-      return event.new_value === "email"
-        ? "Ticket opened from an inbound email."
-        : `${who} opened this ticket.`;
-    case "status":
-      return `${who} changed the status from ${status(event.old_value)} to ${status(event.new_value)}.`;
-    case "priority":
-      return `${who} changed the priority from ${priority(event.old_value)} to ${priority(event.new_value)}.`;
-    case "assignee":
-      if (!event.new_value) return `${who} unassigned this ticket.`;
-      return event.old_value
-        ? `${who} reassigned this ticket from ${event.old_value} to ${event.new_value}.`
-        : `${who} assigned this ticket to ${event.new_value}.`;
-    case "claimed":
-      return `${who} took this ticket.`;
-    case "queue":
-      if (!event.new_value) {
-        return `${who} took this ticket out of ${event.old_value ?? "its queue"}.`;
-      }
-      return `${who} moved this ticket to ${event.new_value}.`;
-    case "reopened":
-      return `Reopened by a reply from the customer (was ${status(event.old_value)}).`;
-    default:
-      return `${who} updated this ticket.`;
-  }
 }

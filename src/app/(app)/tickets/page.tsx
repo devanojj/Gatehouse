@@ -1,43 +1,54 @@
 import Link from "next/link";
 
+import { deleteSavedViewAction } from "@/app/actions/views";
+import { listAgents } from "@/lib/agents";
 import { requireSession } from "@/lib/auth";
-import { formatDate, STATUS_SHORT_LABELS } from "@/lib/format";
-import { listQueues, listQueuesForAgent } from "@/lib/queues";
+import { STATUS_LABELS } from "@/lib/format";
+import { listQueues } from "@/lib/queues";
 import {
   countTicketsByStatus,
   countTicketViews,
+  isPriority,
   isStatus,
   listTickets,
+  PRIORITIES,
   STATUSES,
-  TICKET_LIST_LIMIT,
-  type TicketFilter,
+  toTicketRowView,
 } from "@/lib/tickets";
-import { PriorityBadge, StatusBadge } from "@/app/ui/Badge";
+import type { Priority, Status, TicketFilters } from "@/lib/tickets";
+import { listSavedViews } from "@/lib/views";
 
-/**
- * The saved views. Each one is a named set of filters rather than a query the
- * URL can shape freely — `view=mine` cannot be talked into showing another
- * agent's tickets, because the agent id comes from the session below.
- */
-const VIEWS = ["all", "mine", "unassigned", "waiting", "urgent"] as const;
-type View = (typeof VIEWS)[number];
+import { BulkTicketTable } from "./BulkTicketTable";
+import { SaveViewForm } from "./SaveViewForm";
 
-const VIEW_LABELS: Record<View, string> = {
-  all: "All tickets",
-  mine: "My open tickets",
+export const SYSTEM_VIEWS = [
+  "all",
+  "mine",
+  "unassigned",
+  "waiting",
+  "urgent",
+] as const;
+
+export type SystemView = (typeof SYSTEM_VIEWS)[number];
+
+const SYSTEM_VIEW_LABELS: Record<SystemView, string> = {
+  all: "All",
+  mine: "Assigned to me",
   unassigned: "Unassigned",
-  waiting: "Waiting on customer",
+  waiting: "Waiting on client",
   urgent: "Urgent",
 };
 
-function isView(value: unknown): value is View {
-  return VIEWS.includes(value as View);
+function isSystemView(value: unknown): value is SystemView {
+  return SYSTEM_VIEWS.includes(value as SystemView);
 }
 
 type Params = {
   view?: string;
   status?: string;
   queue?: string;
+  priority?: string;
+  assignee?: string;
   q?: string;
 };
 
@@ -47,153 +58,217 @@ export default async function TicketsPage({
   searchParams: Promise<Params>;
 }) {
   const session = await requireSession();
-  const params = await searchParams;
+  const rawParams = await searchParams;
 
-  const view: View = isView(params.view) ? params.view : "all";
-  const status = isStatus(params.status) ? params.status : undefined;
-  const search = params.q?.trim() ? params.q.trim().slice(0, 120) : undefined;
-
-  // "none" is the only non-numeric queue filter; anything else has to be an id
-  // and is still matched inside this org by `listTickets`.
-  const queueParam = params.queue?.trim();
-  const queueId =
-    queueParam && queueParam !== "none" && /^\d{1,9}$/.test(queueParam)
-      ? Number(queueParam)
-      : undefined;
-  const noQueue = queueParam === "none";
-
-  const filter: TicketFilter = { status, queueId, noQueue, search };
-
-  if (view === "mine") {
-    filter.activeOnly = true;
-    filter.assignedAgentId = session.agentId;
-  } else if (view === "unassigned") {
-    filter.activeOnly = true;
-    filter.unassigned = true;
-  } else if (view === "waiting") {
-    filter.status = status ?? "pending";
-  } else if (view === "urgent") {
-    filter.activeOnly = true;
-    filter.priority = "high";
-  }
-
-  const [tickets, counts, viewCounts, queues, myQueues] = await Promise.all([
-    listTickets(session.orgId, filter),
-    countTicketsByStatus(session.orgId),
-    countTicketViews(session.orgId, session.agentId),
+  // Load saved views and queues early to resolve any URL params
+  const [queues, savedViews, agents] = await Promise.all([
     listQueues(session.orgId),
-    listQueuesForAgent(session.orgId, session.agentId),
+    listSavedViews(session.orgId),
+    listAgents(session.orgId),
   ]);
 
-  /** Keeps the filters that are still meaningful when one of them changes. */
-  function href(overrides: Partial<Params>): string {
+  // If a custom saved view is specified in ?view=id, parse its filters
+  const requestedViewParam = rawParams.view?.trim();
+  const matchedSavedView = savedViews.find(
+    (sv) => String(sv.id) === requestedViewParam,
+  );
+
+  const effectiveParams: Params = { ...rawParams };
+  if (matchedSavedView) {
+    const parsed = new URLSearchParams(matchedSavedView.filters);
+    if (!effectiveParams.status && parsed.get("status")) {
+      effectiveParams.status = parsed.get("status")!;
+    }
+    if (!effectiveParams.queue && parsed.get("queue")) {
+      effectiveParams.queue = parsed.get("queue")!;
+    }
+    if (!effectiveParams.priority && parsed.get("priority")) {
+      effectiveParams.priority = parsed.get("priority")!;
+    }
+    if (!effectiveParams.assignee && parsed.get("assignee")) {
+      effectiveParams.assignee = parsed.get("assignee")!;
+    }
+    if (!effectiveParams.q && parsed.get("q")) {
+      effectiveParams.q = parsed.get("q")!;
+    }
+  }
+
+  const rawStatus = effectiveParams.status;
+  const rawQueue = effectiveParams.queue;
+  const rawPriority = effectiveParams.priority;
+  const rawAssignee = effectiveParams.assignee;
+  const search = effectiveParams.q?.trim() ? effectiveParams.q.trim().slice(0, 150) : undefined;
+
+  const status: Status | undefined = isStatus(rawStatus) ? rawStatus : undefined;
+  const priority: Priority | undefined = isPriority(rawPriority) ? rawPriority : undefined;
+
+  const requestedQueueId = Number(rawQueue);
+  const queue = queues.find((candidate) => candidate.id === requestedQueueId);
+
+  let unassigned: boolean | undefined;
+  let assigneeId: number | undefined;
+  if (rawAssignee === "unassigned") {
+    unassigned = true;
+  } else if (rawAssignee) {
+    const requestedAgentId = Number(rawAssignee);
+    const agent = agents.find((a) => a.id === requestedAgentId);
+    if (agent) assigneeId = agent.id;
+  }
+
+  const activeView: string = matchedSavedView
+    ? String(matchedSavedView.id)
+    : isSystemView(requestedViewParam)
+      ? requestedViewParam
+      : "all";
+
+  const filters: TicketFilters = {
+    status,
+    queueId: queue?.id,
+    priority,
+    assigneeId,
+    unassigned,
+    search,
+  };
+
+  // Apply system view rules
+  if (activeView === "mine") {
+    filters.activeOnly = true;
+    filters.assigneeId = session.agentId;
+  } else if (activeView === "unassigned") {
+    filters.activeOnly = true;
+    filters.unassigned = true;
+  } else if (activeView === "waiting") {
+    filters.status = status ?? "pending_customer";
+  } else if (activeView === "urgent") {
+    filters.activeOnly = true;
+    filters.priority = priority ?? "high";
+  }
+
+  const [tickets, counts, viewCounts] = await Promise.all([
+    listTickets(session.orgId, filters),
+    countTicketsByStatus(session.orgId, queue?.id),
+    countTicketViews(session.orgId, session.agentId),
+  ]);
+
+  /** Helper to generate URLs with preserved and updated filter parameters */
+  function hrefFor(overrides: Partial<Params>): string {
     const next = new URLSearchParams();
     const merged: Params = {
-      view: params.view,
-      status: params.status,
-      queue: params.queue,
-      q: params.q,
+      view: effectiveParams.view,
+      status: effectiveParams.status,
+      queue: effectiveParams.queue,
+      priority: effectiveParams.priority,
+      assignee: effectiveParams.assignee,
+      q: effectiveParams.q,
       ...overrides,
     };
 
     for (const [key, value] of Object.entries(merged)) {
       if (!value) continue;
-      // "all" is the default view and stays out of the URL; a search for the
-      // word "all" is still a search.
       if (key === "view" && value === "all") continue;
       next.set(key, value);
     }
 
-    const query = next.toString();
-    return query ? `/tickets?${query}` : "/tickets";
+    const queryStr = next.toString();
+    return queryStr ? `/tickets?${queryStr}` : "/tickets";
   }
 
-  const viewCount: Record<View, number> = {
-    all: counts.all,
-    mine: viewCounts.mine,
-    unassigned: viewCounts.unassigned,
-    waiting: viewCounts.waiting,
-    urgent: viewCounts.urgent,
-  };
-
-  const activeQueue = queues.find((queue) => queue.id === queueId);
+  // Build the current filter string to allow saving as custom view
+  const currentFiltersForSave = new URLSearchParams();
+  if (status) currentFiltersForSave.set("status", status);
+  if (queue) currentFiltersForSave.set("queue", String(queue.id));
+  if (priority) currentFiltersForSave.set("priority", priority);
+  if (rawAssignee) currentFiltersForSave.set("assignee", rawAssignee);
+  if (search) currentFiltersForSave.set("q", search);
+  const filterQueryString = currentFiltersForSave.toString();
+  const hasActiveFilters = Boolean(
+    status || queue || priority || rawAssignee || search || activeView !== "all",
+  );
 
   return (
     <>
       <div className="page-head">
         <div>
           <h1>Tickets</h1>
-          <p>Everything {session.orgName} is working on.</p>
+          <p>
+            {queue
+              ? `${queue.name} · ${session.orgName}`
+              : `Everything ${session.orgName} is working on.`}
+          </p>
         </div>
         <Link className="btn btn-primary" href="/tickets/new">
           New ticket
         </Link>
       </div>
 
+      {/* Views Navigation: System Views + Custom Saved Views */}
       <nav className="views" aria-label="Views">
-        {VIEWS.map((key) => (
-          <Link
-            key={key}
-            href={href({ view: key === "all" ? undefined : key })}
-            aria-current={view === key ? "page" : undefined}
-          >
-            {VIEW_LABELS[key]}
-            <span className="tab-count">{viewCount[key]}</span>
-          </Link>
-        ))}
+        {SYSTEM_VIEWS.map((key) => {
+          const count = viewCounts[key];
+          return (
+            <Link
+              key={key}
+              href={hrefFor({ view: key === "all" ? undefined : key })}
+              aria-current={activeView === key ? "page" : undefined}
+            >
+              {SYSTEM_VIEW_LABELS[key]}
+              <span className="tab-count">{count}</span>
+            </Link>
+          );
+        })}
 
-        {myQueues.map((queue) => (
-          <Link
-            key={queue.id}
-            href={href({ queue: String(queue.id) })}
-            aria-current={queueId === queue.id ? "page" : undefined}
+        {savedViews.map((sv) => (
+          <div
+            key={sv.id}
+            className={`view-pill-custom ${activeView === String(sv.id) ? "active" : ""}`}
           >
-            {queue.name}
-            <span className="tab-count">{queue.open_count ?? 0}</span>
-          </Link>
+            <Link
+              href={hrefFor({ view: String(sv.id) })}
+              aria-current={activeView === String(sv.id) ? "page" : undefined}
+            >
+              {sv.name}
+            </Link>
+            <form action={deleteSavedViewAction} className="inline-delete-form">
+              <input type="hidden" name="viewId" value={sv.id} />
+              <button
+                type="submit"
+                className="view-delete-btn"
+                title={`Delete view ${sv.name}`}
+                aria-label={`Delete view ${sv.name}`}
+              >
+                ×
+              </button>
+            </form>
+          </div>
         ))}
       </nav>
 
+      {/* Status tabs */}
       <nav className="tabs" aria-label="Status">
         <Link
-          href={href({ status: undefined })}
-          aria-current={status ? undefined : "page"}
+          href={hrefFor({ status: undefined })}
+          aria-current={!status ? "page" : undefined}
         >
-          Any status
-          <span className="tab-count">{counts.all}</span>
+          All
+          <span className="tab-count">{counts.all ?? 0}</span>
         </Link>
-        {STATUSES.map((key) => (
+        {STATUSES.map((option) => (
           <Link
-            key={key}
-            href={href({ status: key })}
-            aria-current={status === key ? "page" : undefined}
+            key={option}
+            href={hrefFor({ status: option })}
+            aria-current={status === option ? "page" : undefined}
           >
-            {STATUS_SHORT_LABELS[key]}
-            <span className="tab-count">{counts[key] ?? 0}</span>
+            {STATUS_LABELS[option]}
+            <span className="tab-count">{counts[option] ?? 0}</span>
           </Link>
         ))}
       </nav>
 
-      {/* A plain GET form: no JavaScript, and the filters end up in the URL so
-          a view can be linked to or bookmarked. */}
-      <form className="filter-bar" action="/tickets">
-        {view !== "all" ? <input type="hidden" name="view" value={view} /> : null}
-        {status ? <input type="hidden" name="status" value={status} /> : null}
-
-        <div className="field">
-          <label className="label" htmlFor="filter-queue">
-            Queue
-          </label>
-          <select id="filter-queue" name="queue" defaultValue={queueParam ?? ""}>
-            <option value="">Any queue</option>
-            <option value="none">No queue</option>
-            {queues.map((queue) => (
-              <option key={queue.id} value={String(queue.id)}>
-                {queue.name}
-              </option>
-            ))}
-          </select>
-        </div>
+      {/* Filter Bar with URL state synchronization */}
+      <form className="filter-bar" action="/tickets" method="GET">
+        {activeView && activeView !== "all" ? (
+          <input type="hidden" name="view" value={activeView} />
+        ) : null}
 
         <div className="field">
           <label className="label" htmlFor="filter-q">
@@ -204,81 +279,108 @@ export default async function TicketsPage({
             name="q"
             type="search"
             defaultValue={search ?? ""}
-            placeholder="Ticket number, subject, sender…"
+            placeholder="Search subject, requester, notes…"
           />
         </div>
 
-        <div className="form-actions">
+        {queues.length > 1 ? (
+          <div className="field">
+            <label className="label" htmlFor="filter-queue">
+              Queue
+            </label>
+            <select id="filter-queue" name="queue" defaultValue={queue?.id ?? ""}>
+              <option value="">All queues</option>
+              {queues.map((q) => (
+                <option key={q.id} value={String(q.id)}>
+                  {q.name}
+                </option>
+              ))}
+            </select>
+          </div>
+        ) : null}
+
+        <div className="field">
+          <label className="label" htmlFor="filter-priority">
+            Priority
+          </label>
+          <select id="filter-priority" name="priority" defaultValue={priority ?? ""}>
+            <option value="">Any priority</option>
+            {PRIORITIES.map((p) => (
+              <option key={p} value={p}>
+                {p.charAt(0).toUpperCase() + p.slice(1)}
+              </option>
+            ))}
+          </select>
+        </div>
+
+        <div className="field">
+          <label className="label" htmlFor="filter-assignee">
+            Assignee
+          </label>
+          <select id="filter-assignee" name="assignee" defaultValue={rawAssignee ?? ""}>
+            <option value="">Anyone</option>
+            <option value="unassigned">Unassigned</option>
+            {agents.map((a) => (
+              <option key={a.id} value={String(a.id)}>
+                {a.name}
+              </option>
+            ))}
+          </select>
+        </div>
+
+        <div className="form-actions filter-actions">
           <button className="btn btn-secondary" type="submit">
-            Apply
+            Filter
           </button>
-          {search || queueParam || status || view !== "all" ? (
+          {hasActiveFilters ? (
             <Link className="btn-link" href="/tickets">
               Clear
             </Link>
           ) : null}
+          {filterQueryString ? (
+            <SaveViewForm filtersQuery={filterQueryString} />
+          ) : null}
         </div>
       </form>
 
-      {search || activeQueue || noQueue ? (
+      {/* Search & Filter Results Summary */}
+      {search || queue || priority || rawAssignee ? (
         <div className="search-summary">
           <span className="muted">
-            {tickets.length === TICKET_LIST_LIMIT
-              ? `First ${TICKET_LIST_LIMIT} matches`
-              : `${tickets.length} ${tickets.length === 1 ? "match" : "matches"}`}
-            {search ? ` for “${search}”` : ""}
-            {activeQueue ? ` in ${activeQueue.name}` : ""}
-            {noQueue ? " with no queue" : ""}
+            {tickets.length} {tickets.length === 1 ? "ticket" : "tickets"}
+            {search ? ` matching “${search}”` : ""}
+            {queue ? ` in ${queue.name}` : ""}
+            {priority ? ` · ${priority} priority` : ""}
+            {rawAssignee === "unassigned"
+              ? " · unassigned"
+              : assigneeId
+                ? ` · assigned to ${agents.find((a) => a.id === assigneeId)?.name}`
+                : ""}
           </span>
         </div>
       ) : null}
 
+      {/* Ticket List Card with Bulk Actions */}
       <div className="card">
         {tickets.length === 0 ? (
           <p className="empty">
-            {search
-              ? "Nothing matches that search."
-              : view === "all" && !status && !queueParam
-                ? "No tickets yet. Create the first one."
-                : "No tickets in this view."}
+            {hasActiveFilters ? (
+              <>
+                No tickets match the current filters.{" "}
+                <Link href="/tickets">Clear filters</Link>
+              </>
+            ) : (
+              "No tickets yet. Create the first one."
+            )}
           </p>
         ) : (
-          <div className="table-wrap">
-            <table>
-              <thead>
-                <tr>
-                  <th>#</th>
-                  <th>Subject</th>
-                  <th>Status</th>
-                  <th>Priority</th>
-                  <th>Queue</th>
-                  <th>Assignee</th>
-                  <th>Updated</th>
-                </tr>
-              </thead>
-              <tbody>
-                {tickets.map((ticket) => (
-                  <tr key={ticket.id}>
-                    <td className="num">{ticket.id}</td>
-                    <td className="subject">
-                      <Link href={`/tickets/${ticket.id}`}>{ticket.subject}</Link>
-                    </td>
-                    <td>
-                      <StatusBadge status={ticket.status} />
-                    </td>
-                    <td>
-                      <PriorityBadge priority={ticket.priority} />
-                    </td>
-                    <td className="muted nowrap">{ticket.queue_name ?? "—"}</td>
-                    <td className="muted nowrap">
-                      {ticket.assigned_agent_name ?? "Unassigned"}
-                    </td>
-                    <td className="muted nowrap">{formatDate(ticket.updated_at)}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+          <BulkTicketTable
+            tickets={tickets.map(toTicketRowView)}
+            queues={queues.map((queue) => ({ id: queue.id, name: queue.name }))}
+            agents={agents.map((agent) => ({ id: agent.id, name: agent.name }))}
+            currentAgentId={session.agentId}
+            userRole={session.role}
+          />
         )}
       </div>
     </>

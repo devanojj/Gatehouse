@@ -1,20 +1,14 @@
 import "server-only";
 
 import { createComment, messageAlreadyFiled } from "./comments";
-import { readableBody } from "./mail-text";
-import {
-  inboundCredentials,
-  listOrganizationsWithInbound,
-  type Organization,
-} from "./orgs";
+import { inboundCredentials, type Organization } from "./orgs";
 import { slugFromAddress } from "./slug";
 import { ticketIdFromSubject } from "./ticket-mail";
 import {
   createTicket,
   findOpenTicketByRequester,
   getTicket,
-  reopenTicket,
-  reopensOnReply,
+  reopenIfResolved,
   touchTicket,
 } from "./tickets";
 
@@ -55,7 +49,7 @@ export type InboundMessage = {
 
 export type FiledMessage =
   | { outcome: "created"; ticketId: number }
-  | { outcome: "appended"; ticketId: number; reopened?: boolean }
+  | { outcome: "appended"; ticketId: number }
   | { outcome: "duplicate" };
 
 export type InboundSummary = {
@@ -63,21 +57,12 @@ export type InboundSummary = {
   matched: number;
   created: number;
   appended: number;
-  /** Replies that put a pending or resolved ticket back in the queue. */
-  reopened: number;
   duplicates: number;
   failed: number;
 };
 
 export function emptySummary(): InboundSummary {
-  return {
-    matched: 0,
-    created: 0,
-    appended: 0,
-    reopened: 0,
-    duplicates: 0,
-    failed: 0,
-  };
+  return { matched: 0, created: 0, appended: 0, duplicates: 0, failed: 0 };
 }
 
 // ------------------------------------------------------------------- routing
@@ -103,16 +88,11 @@ export function messageBelongsTo(
  * Files one message into a ticket, in the order the routing rules say:
  *
  *   1. a `[Ticket #N]` marker in the subject, resolved inside this org;
- *   2. otherwise the sender's most recent ticket that is not closed;
+ *   2. otherwise the sender's most recent ticket that is still open;
  *   3. otherwise a new ticket.
  *
  * Every lookup is scoped to `org.id`, so a ticket number belonging to another
  * tenant simply does not resolve and the message starts a fresh ticket here.
- *
- * A reply to a ticket that was waiting on the customer, or that an agent had
- * marked resolved, reopens it: the customer has come back and somebody needs to
- * look again. A `closed` ticket is left closed — closing is the deliberate end
- * of a conversation, and a reply to one is appended without changing it.
  */
 export async function fileMessage(
   org: Organization,
@@ -123,12 +103,15 @@ export async function fileMessage(
   }
 
   const referenced = ticketIdFromSubject(message.subject);
+  const marked = referenced ? await getTicket(org.id, referenced) : null;
 
   // A marker naming a ticket this org does not have — stale, or another
   // tenant's number — resolves to nothing and falls through to the sender's
-  // own thread rather than reaching across the boundary.
+  // own thread rather than reaching across the boundary. A marker naming a
+  // closed ticket is ignored the same way: a closed ticket is a finished
+  // record, so the reply opens a new one instead of reviving it.
   const existing =
-    (referenced ? await getTicket(org.id, referenced) : null) ??
+    (marked && marked.status !== "closed" ? marked : null) ??
     (await findOpenTicketByRequester(org.id, message.from));
 
   if (existing) {
@@ -136,27 +119,21 @@ export async function fileMessage(
       authorEmail: message.from,
       messageId: message.messageId,
     });
-
-    if (reopensOnReply(existing.status)) {
-      await reopenTicket(org.id, existing.id);
-      return { outcome: "appended", ticketId: existing.id, reopened: true };
-    }
-
     await touchTicket(org.id, existing.id);
+
+    await reopenIfResolved(org.id, existing);
+
     return { outcome: "appended", ticketId: existing.id };
   }
 
-  const ticketId = await createTicket(
-    org.id,
-    {
-      subject: message.subject,
-      description: message.body,
-      priority: "medium",
-      requesterEmail: message.from,
-      sourceMessageId: message.messageId,
-    },
-    { agentId: null, label: "email" },
-  );
+  const ticketId = await createTicket(org.id, {
+    subject: message.subject,
+    description: message.body,
+    priority: "medium",
+    requesterEmail: message.from,
+    sourceMessageId: message.messageId,
+    source: "email",
+  });
 
   return { outcome: "created", ticketId };
 }
@@ -167,7 +144,6 @@ type ParsedLike = {
   messageId?: string;
   subject?: string;
   text?: string;
-  html?: string | false;
   from?: { value: { address?: string }[] };
   headerLines?: readonly { key: string; line: string }[];
 };
@@ -195,21 +171,15 @@ export function toInboundMessage(
     }
   }
 
-  // HTML-only mail is flattened to text and quoted history is trimmed, both by
-  // `mail-text`, which falls back to the whole message rather than risk cutting
-  // a customer's words. A message with no words at all still becomes a ticket.
-  const body = readableBody({
-    text: parsed.text,
-    html: parsed.html === false ? null : parsed.html,
-  });
-
   return {
     messageId: parsed.messageId?.trim() || fallbackId,
     from,
     subject: parsed.subject?.trim() || "(no subject)",
+    // HTML-only mail is out of scope for now; the ticket is still created so
+    // nothing is silently dropped on the floor.
     body:
-      body ??
-      "(This message had no readable body. Open it in the mailbox to read it.)",
+      parsed.text?.trim() ||
+      "(This message had no plain-text part. Open it in the mailbox to read it.)",
     recipients: [...recipients],
   };
 }
@@ -322,14 +292,9 @@ export async function fetchInboundMail(
 
         try {
           const filed = await fileMessage(org, message);
-          if (filed.outcome === "created") {
-            summary.created++;
-          } else if (filed.outcome === "appended") {
-            summary.appended++;
-            if (filed.reopened) summary.reopened++;
-          } else {
-            summary.duplicates++;
-          }
+          if (filed.outcome === "created") summary.created++;
+          else if (filed.outcome === "appended") summary.appended++;
+          else summary.duplicates++;
 
           // Only flag it once it is safely in the database — a message that
           // failed to file stays unread and is retried on the next check.
@@ -347,53 +312,4 @@ export async function fetchInboundMail(
   }
 
   return summary;
-}
-
-// ------------------------------------------------------------------ polling
-
-export type OrgPollResult = {
-  orgId: number;
-  /** The organization's own name, for server logs only. */
-  orgName: string;
-  summary?: InboundSummary;
-  error?: string;
-};
-
-/**
- * Polls every organization that has an inbound address.
- *
- * This is the scheduled counterpart of the Settings button, and it deliberately
- * runs the *same* `fetchInboundMail` per organization rather than a second
- * routing implementation: each pass connects, reads only the messages carrying
- * that org's slug, and files them through the org-scoped functions. Nothing
- * here takes an organization from a request.
- *
- * One tenant's failure — a locked mailbox, a malformed message — is caught and
- * recorded so the remaining organizations are still polled.
- */
-export async function pollAllInboxes(): Promise<OrgPollResult[]> {
-  if (!inboundCredentials()) {
-    throw new Error(
-      "The shared inbox is not configured. Set GMAIL_USER and GMAIL_APP_PASSWORD on the server.",
-    );
-  }
-
-  const organizations = await listOrganizationsWithInbound();
-  const results: OrgPollResult[] = [];
-
-  for (const org of organizations) {
-    try {
-      results.push({
-        orgId: org.id,
-        orgName: org.name,
-        summary: await fetchInboundMail(org),
-      });
-    } catch (error) {
-      const detail = error instanceof Error ? error.message : String(error);
-      console.error(`Inbound poll failed for org ${org.id}:`, error);
-      results.push({ orgId: org.id, orgName: org.name, error: detail });
-    }
-  }
-
-  return results;
 }

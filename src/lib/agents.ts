@@ -1,7 +1,9 @@
 import "server-only";
 
-import { insert, queryOne, query, SLUG_ATTEMPTS } from "./db";
-import { newInboundSlug } from "./slug";
+import { insert, queryOne, query } from "./db";
+import { availablePortalSlug } from "./orgs";
+import { ensureDefaultQueue } from "./queues";
+import { newInboundSlug, SLUG_ATTEMPTS } from "./slug";
 
 export type Agent = {
   id: number;
@@ -26,21 +28,6 @@ export async function findAgentByEmail(email: string): Promise<Agent | null> {
   ]);
 }
 
-/**
- * One agent inside an organization. Server Actions call this to turn an id from
- * a form into a real teammate before using it, so a foreign id is "not found"
- * rather than a silent no-op.
- */
-export async function getAgent(
-  orgId: number,
-  agentId: number,
-): Promise<Agent | null> {
-  return queryOne<Agent>(`SELECT * FROM agents WHERE org_id = ? AND id = ?`, [
-    orgId,
-    agentId,
-  ]);
-}
-
 export async function listAgents(orgId: number): Promise<Agent[]> {
   return query<Agent>(
     `SELECT * FROM agents WHERE org_id = ? ORDER BY name COLLATE NOCASE`,
@@ -59,10 +46,19 @@ async function insertOrganization(
 ): Promise<number> {
   for (let attempt = 1; ; attempt++) {
     try {
+      // Two slugs, for two different jobs: the inbound one is a mail routing
+      // key with a random suffix so it cannot be guessed, the portal one is a
+      // readable URL customers retype. Both are re-derived on each attempt so a
+      // retry after a collision actually picks something new.
       return await insert(
-        `INSERT INTO organizations (name, support_email, inbound_slug)
-         VALUES (?, ?, ?)`,
-        [orgName, supportEmail, newInboundSlug(orgName)],
+        `INSERT INTO organizations (name, support_email, inbound_slug, portal_slug)
+         VALUES (?, ?, ?, ?)`,
+        [
+          orgName,
+          supportEmail,
+          newInboundSlug(orgName),
+          await availablePortalSlug(orgName),
+        ],
       );
     } catch (error) {
       // Only a slug collision is worth re-rolling; anything else is a real
@@ -84,6 +80,9 @@ export async function createOrganizationWithOwner(
     `INSERT INTO agents (org_id, name, email, role) VALUES (?, ?, ?, 'owner')`,
     [orgId, agentName, normalizeEmail(email)],
   );
+
+  // A new workspace has somewhere to put its first ticket before it has one.
+  await ensureDefaultQueue(orgId);
 
   return { orgId, agentId };
 }
