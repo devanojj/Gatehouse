@@ -8,8 +8,10 @@ import { createComment, isAgentCommentType } from "@/lib/comments";
 import { recordEvent } from "@/lib/events";
 import { getQueue } from "@/lib/queues";
 import { getOrganization } from "@/lib/orgs";
+import { createNotification } from "@/lib/notifications";
 import { sendTicketReply } from "@/lib/ticket-mail";
 import {
+  bulkUpdateTickets,
   canTransition,
   claimTicket,
   createTicket,
@@ -24,7 +26,7 @@ import {
   updateStatus,
 } from "@/lib/tickets";
 
-import type { Ticket } from "@/lib/tickets";
+import type { BulkUpdateParams, Ticket } from "@/lib/tickets";
 
 /** What the timeline shows in place of an assignee's name. */
 const UNASSIGNED = "Unassigned";
@@ -170,6 +172,19 @@ export async function setAssigneeAction(formData: FormData): Promise<void> {
     to: updated?.assigned_agent_name ?? UNASSIGNED,
   });
 
+  if (
+    updated?.assigned_agent_id &&
+    updated.assigned_agent_id !== session.agentId
+  ) {
+    await createNotification(session.orgId, {
+      agentId: updated.assigned_agent_id,
+      ticketId,
+      type: "ticket_assigned",
+      title: "Ticket Assigned",
+      body: `You were assigned ticket #${ticketId} ("${ticket.subject}") by ${session.agentName}.`,
+    });
+  }
+
   revalidatePath(`/tickets/${ticketId}`);
   revalidatePath("/tickets");
 }
@@ -292,4 +307,58 @@ export async function addCommentAction(
   }
 
   return {};
+}
+
+/**
+ * Applies a bulk modification across multiple tickets within the caller's org.
+ */
+export async function bulkUpdateTicketsAction(formData: FormData): Promise<void> {
+  const session = await requireSession();
+
+  const ticketIds = formData
+    .getAll("ticketId")
+    .map((v) => Number(v))
+    .filter((id) => Number.isInteger(id) && id > 0);
+
+  if (ticketIds.length === 0) return;
+
+  const action = formData.get("action");
+  let updateParams: BulkUpdateParams;
+
+  if (action === "status") {
+    const status = formData.get("status");
+    if (!isStatus(status)) throw new Error("Invalid status.");
+    updateParams = { action: "status", status };
+  } else if (action === "priority") {
+    const priority = formData.get("priority");
+    if (!isPriority(priority)) throw new Error("Invalid priority.");
+    updateParams = { action: "priority", priority };
+  } else if (action === "assignee") {
+    const raw = String(formData.get("assignedAgentId") ?? "");
+    const agentId = raw === "" ? null : Number(raw);
+    if (agentId !== null && !Number.isInteger(agentId)) {
+      throw new Error("Invalid assignee.");
+    }
+    updateParams = { action: "assignee", assignedAgentId: agentId };
+  } else if (action === "queue") {
+    const queueId = Number(formData.get("queueId"));
+    if (!Number.isInteger(queueId) || queueId <= 0) {
+      throw new Error("Invalid queue.");
+    }
+    const queue = await getQueue(session.orgId, queueId);
+    if (!queue) throw new Error("Queue not found.");
+    updateParams = { action: "queue", queueId: queue.id };
+  } else {
+    throw new Error("Unknown bulk action.");
+  }
+
+  await bulkUpdateTickets(session.orgId, ticketIds, updateParams, {
+    agentId: session.agentId,
+    role: session.role,
+  });
+
+  revalidatePath("/tickets");
+  for (const id of ticketIds) {
+    revalidatePath(`/tickets/${id}`);
+  }
 }

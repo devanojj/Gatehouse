@@ -4,7 +4,9 @@ import { cache } from "react";
 
 import { findOrganizationByPortalSlug } from "./orgs";
 
+import type { ArticleWithCategory } from "./articles";
 import type { Comment } from "./comments";
+import type { KbCategory, KbCategoryWithCount } from "./kb-categories";
 import type { Status, Ticket } from "./tickets";
 
 /**
@@ -101,3 +103,65 @@ export const CUSTOMER_STATUS_TONE: Record<Status, string> = {
 export function customerCanReply(ticket: PortalTicket): boolean {
   return ticket.status !== "closed";
 }
+
+export type PortalArticle = {
+  id: number;
+  title: string;
+  slug: string;
+  body: string;
+  category_id: number | null;
+  category_name: string | null;
+  category_slug: string | null;
+  published_at: string | null;
+  updated_at: string;
+};
+
+export type PortalCategory = {
+  id: number;
+  name: string;
+  slug: string;
+  description: string | null;
+  position: number;
+  article_count?: number;
+};
+
+/**
+ * Public portal article projection.
+ *
+ * Strips operational and internal agent fields (author, org_id, draft status).
+ * Returns null if the article is not published.
+ */
+export function toPortalArticle(
+  article: ArticleWithCategory,
+): PortalArticle | null {
+  if (article.status !== "published") return null;
+  return {
+    id: article.id,
+    title: article.title,
+    slug: article.slug,
+    body: article.body,
+    category_id: article.category_id,
+    category_name: article.category_name,
+    category_slug: article.category_slug,
+    published_at: article.published_at,
+    updated_at: article.updated_at,
+  };
+}
+
+/**
+ * Public portal category projection.
+ */
+export function toPortalCategory(
+  category: KbCategory | KbCategoryWithCount,
+): PortalCategory {
+  return {
+    id: category.id,
+    name: category.name,
+    slug: category.slug,
+    description: category.description,
+    position: category.position,
+    article_count:
+      "article_count" in category ? category.article_count : undefined,
+  };
+}
+

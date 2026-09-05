@@ -167,6 +167,60 @@ test("a pre-migration database converges without losing rows", async () => {
   );
   assert.equal(portal.rows[0].portal_slug, "legacy-co");
   assert.notEqual(portal.rows[0].portal_slug, portal.rows[0].inbound_slug);
+
+  // Migration 006: FTS5 and saved views exist, and tickets were backfilled
+  const ftsMatches = await client.execute(
+    `SELECT ticket_id FROM tickets_fts WHERE tickets_fts MATCH '"Old"*'`,
+  );
+  assert.equal(
+    ftsMatches.rows.length,
+    2,
+    "existing tickets should be backfilled into the FTS5 search index",
+  );
+
+  const savedViewsTable = await client.execute(
+    `SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'saved_views'`,
+  );
+  assert.equal(savedViewsTable.rows.length, 1);
+
+  // Migration 007: Knowledge base tables and FTS exist
+  const kbTables = await client.execute(
+    `SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('kb_categories', 'articles', 'articles_fts')`,
+  );
+  assert.equal(kbTables.rows.length, 3, "knowledge base tables and virtual table should exist");
+
+  // Migration 008: SLA and notification tables, SLA columns on tickets, default SLA policies backfilled
+  const slaTables = await client.execute(
+    `SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('sla_policies', 'sla_targets', 'notifications')`,
+  );
+  assert.equal(slaTables.rows.length, 3, "sla and notification tables should exist");
+
+  const defaultPolicies = await client.execute(
+    `SELECT COUNT(*) AS n FROM sla_policies WHERE org_id = 1 AND is_default = 1`,
+  );
+  assert.equal(Number(defaultPolicies.rows[0].n), 1, "default SLA policy should be backfilled for existing org");
+
+  const defaultTargets = await client.execute(
+    `SELECT COUNT(*) AS n FROM sla_targets WHERE policy_id = 1`,
+  );
+  assert.equal(Number(defaultTargets.rows[0].n), 3, "default SLA targets for 3 priorities should exist");
+
+  // Migration 009: Routing rules table and reporting/audit indexes
+  const routingTable = await client.execute(
+    `SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'routing_rules'`,
+  );
+  assert.equal(routingTable.rows.length, 1, "routing_rules table should exist");
+
+  const indexes = await client.execute(
+    `SELECT name FROM sqlite_master WHERE type = 'index' AND name IN (
+      'idx_routing_rules_org_pos',
+      'idx_tickets_org_created',
+      'idx_tickets_org_resolved',
+      'idx_ticket_events_org_created',
+      'idx_ticket_events_org_kind'
+    )`,
+  );
+  assert.equal(indexes.rows.length, 5, "reporting and audit indexes should exist");
 });
 
 test("portal slugs stay unique when two orgs share a name", async () => {

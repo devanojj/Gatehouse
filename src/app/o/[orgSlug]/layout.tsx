@@ -38,6 +38,7 @@ export default async function PortalLayout({
           </Link>
 
           <nav className="portal-nav">
+            <Link href={`/o/${orgSlug}/kb`}>Help Center</Link>
             <Link href={`/o/${orgSlug}/support/new`}>New request</Link>
             {signedIn ? (
               <>

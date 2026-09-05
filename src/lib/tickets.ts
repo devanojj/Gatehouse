@@ -3,7 +3,10 @@ import "server-only";
 import { findOrCreateCustomer } from "./customers";
 import { execute, executeCounting, insert, query, queryOne } from "./db";
 import { recordEvent } from "./events";
+import { createNotification } from "./notifications";
 import { ensureDefaultQueue } from "./queues";
+import { evaluateRoutingRules } from "./routing";
+import { calculateSlaDeadlines } from "./sla";
 
 /**
  * The ticket lifecycle, in the order it is worked. `closed` is the end of the
@@ -87,12 +90,19 @@ export type Ticket = {
   requester_customer_id: number | null;
   public_token: string | null;
   public_token_expires_at: string | null;
+  sla_policy_id: number | null;
+  sla_first_response_due_at: string | null;
+  sla_resolution_due_at: string | null;
+  sla_first_response_breached: number;
+  sla_resolution_breached: number;
+  sla_breached: number;
   created_at: string;
   updated_at: string;
 };
 
 /** For inlining into SQL — the values come from the constant, never a caller. */
 const REPLYABLE_STATUS_LIST = REPLYABLE_STATUSES.map((s) => `'${s}'`).join(", ");
+const ACTIVE_STATUS_LIST = ACTIVE_STATUSES.map((s) => `'${s}'`).join(", ");
 
 const SELECT_TICKET = `
   SELECT t.*, a.name AS assigned_agent_name, q.name AS queue_name
@@ -106,15 +116,78 @@ const SELECT_TICKET = `
 `;
 
 /**
+ * Sanitizes a user's search query into safe FTS5 prefix tokens.
+ * Strips special SQLite FTS5 operators to prevent syntax errors.
+ * Matches pure numeric tokens exactly, and alphabetic tokens with wildcard.
+ */
+export function toFtsQuery(raw: string): string | null {
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  const words = trimmed.match(/[\p{L}\p{N}_]+/gu);
+  if (!words || words.length === 0) return null;
+  return words
+    .map((w) => (/^\d+$/.test(w) ? `"${w}"` : `"${w.replace(/"/g, "")}"*`))
+    .join(" ");
+}
+
+/**
+ * Extracts a numeric ticket ID from searches like "#42" or "42".
+ */
+export function ticketNumberFromSearch(raw: string): number | null {
+  const digits = raw.trim().replace(/^#/, "");
+  if (!/^\d{1,9}$/.test(digits)) return null;
+  const id = Number(digits);
+  return Number.isInteger(id) && id > 0 ? id : null;
+}
+
+/**
  * Every function in this module takes `orgId` as its first argument and puts it
  * in the WHERE clause. A ticket id on its own is never enough to reach a row.
  */
+/**
+ * What a ticket looks like once it crosses into a Client Component.
+ *
+ * The agent workspace runs on the server, so a `Ticket` normally never leaves
+ * it. `BulkTicketTable` is the exception — it holds a selection — and a whole
+ * row would ship every column to the browser, `public_token` and
+ * `source_message_id` among them. Built from named fields for the same reason
+ * `toPortalTicket` is: adding a column to `tickets` must not quietly widen what
+ * gets serialized.
+ */
+export type TicketRowView = {
+  id: number;
+  subject: string;
+  status: Status;
+  priority: Priority;
+  queue_name: string | null;
+  assigned_agent_name: string | null;
+  created_at: string;
+};
+
+export function toTicketRowView(ticket: Ticket): TicketRowView {
+  return {
+    id: ticket.id,
+    subject: ticket.subject,
+    status: ticket.status,
+    priority: ticket.priority,
+    queue_name: ticket.queue_name,
+    assigned_agent_name: ticket.assigned_agent_name,
+    created_at: ticket.created_at,
+  };
+}
+
 export type TicketFilters = {
   status?: Status;
   queueId?: number;
+  priority?: Priority;
   assigneeId?: number;
   /** Tickets nobody has picked up. Takes precedence over `assigneeId`. */
   unassigned?: boolean;
+  /** Restricts to active statuses: open, in_progress, pending_customer */
+  activeOnly?: boolean;
+  /** Full-text search term or ticket number */
+  search?: string;
+  limit?: number;
 };
 
 /**
@@ -139,6 +212,15 @@ export async function listTickets(
     args.push(filters.queueId);
   }
 
+  if (filters.priority) {
+    clauses.push("t.priority = ?");
+    args.push(filters.priority);
+  }
+
+  if (filters.activeOnly) {
+    clauses.push(`t.status IN (${ACTIVE_STATUS_LIST})`);
+  }
+
   if (filters.unassigned) {
     clauses.push("t.assigned_agent_id IS NULL");
   } else if (filters.assigneeId) {
@@ -146,10 +228,44 @@ export async function listTickets(
     args.push(filters.assigneeId);
   }
 
-  return query<Ticket>(
-    `${SELECT_TICKET} WHERE ${clauses.join(" AND ")} ORDER BY t.created_at DESC`,
-    args,
-  );
+  if (filters.search) {
+    const rawSearch = filters.search.trim().slice(0, 150);
+    const ticketNum = ticketNumberFromSearch(rawSearch);
+    const isExplicitId = rawSearch.startsWith("#") && ticketNum !== null;
+
+    if (isExplicitId) {
+      clauses.push("t.id = ?");
+      args.push(ticketNum);
+    } else {
+      const ftsQuery = toFtsQuery(rawSearch);
+
+      if (ticketNum !== null && ftsQuery) {
+        clauses.push(
+          `(t.id = ? OR t.id IN (SELECT ticket_id FROM tickets_fts WHERE org_id = ? AND tickets_fts MATCH ?))`,
+        );
+        args.push(ticketNum, orgId, ftsQuery);
+      } else if (ticketNum !== null) {
+        clauses.push(`t.id = ?`);
+        args.push(ticketNum);
+      } else if (ftsQuery) {
+        clauses.push(
+          `t.id IN (SELECT ticket_id FROM tickets_fts WHERE org_id = ? AND tickets_fts MATCH ?)`,
+        );
+        args.push(orgId, ftsQuery);
+      } else {
+        clauses.push("1 = 0");
+      }
+    }
+  }
+
+  let sql = `${SELECT_TICKET} WHERE ${clauses.join(" AND ")} ORDER BY t.created_at DESC`;
+  if (filters.limit) {
+    const limit = Math.min(Math.max(1, filters.limit), 500);
+    sql += ` LIMIT ?`;
+    args.push(limit);
+  }
+
+  return query<Ticket>(sql, args);
 }
 
 /**
@@ -178,6 +294,50 @@ export async function countTicketsByStatus(
   return counts;
 }
 
+export type ViewCounts = {
+  all: number;
+  mine: number;
+  unassigned: number;
+  waiting: number;
+  urgent: number;
+};
+
+/**
+ * Single-pass query computing ticket counts for built-in views:
+ * all, mine (active assigned to caller), unassigned (active unassigned),
+ * waiting (pending_customer), and urgent (high priority active).
+ */
+export async function countTicketViews(
+  orgId: number,
+  agentId: number,
+): Promise<ViewCounts> {
+  const row = await queryOne<{
+    total: number;
+    mine: number;
+    unassigned: number;
+    waiting: number;
+    urgent: number;
+  }>(
+    `SELECT
+       COUNT(*) AS total,
+       SUM(CASE WHEN status IN (${ACTIVE_STATUS_LIST}) AND assigned_agent_id = ? THEN 1 ELSE 0 END) AS mine,
+       SUM(CASE WHEN status IN (${ACTIVE_STATUS_LIST}) AND assigned_agent_id IS NULL THEN 1 ELSE 0 END) AS unassigned,
+       SUM(CASE WHEN status = 'pending_customer' THEN 1 ELSE 0 END) AS waiting,
+       SUM(CASE WHEN status IN (${ACTIVE_STATUS_LIST}) AND priority = 'high' THEN 1 ELSE 0 END) AS urgent
+     FROM tickets
+    WHERE org_id = ?`,
+    [agentId, orgId],
+  );
+
+  return {
+    all: Number(row?.total ?? 0),
+    mine: Number(row?.mine ?? 0),
+    unassigned: Number(row?.unassigned ?? 0),
+    waiting: Number(row?.waiting ?? 0),
+    urgent: Number(row?.urgent ?? 0),
+  };
+}
+
 export async function getTicket(
   orgId: number,
   ticketId: number,
@@ -201,13 +361,14 @@ export async function createTicket(
   orgId: number,
   fields: {
     subject: string;
-    description: string | null;
+    description?: string | null;
     priority: Priority;
-    requesterEmail: string | null;
+    requesterEmail?: string | null;
     sourceMessageId?: string | null;
     actorAgentId?: number | null;
     /** Resolved against this org; anything else falls back to the default. */
     queueId?: number | null;
+    assignedAgentId?: number | null;
     requesterCustomerId?: number | null;
     /** The one-off confirmation link handed back at submission. */
     publicToken?: string | null;
@@ -220,6 +381,18 @@ export async function createTicket(
   // a foreign queue id becomes the default rather than a cross-tenant write.
   const fallbackQueueId = await ensureDefaultQueue(orgId);
 
+  // Evaluate automatic routing rules
+  const routing = await evaluateRoutingRules(orgId, {
+    subject: fields.subject,
+    description: fields.description,
+    requesterEmail: fields.requesterEmail,
+  });
+
+  const effectivePriority = routing.priority ?? fields.priority;
+  const targetQueueId = fields.queueId ?? routing.queueId ?? null;
+  const initialAssigneeId =
+    fields.assignedAgentId ?? routing.assignedAgentId ?? null;
+
   // A requester with an address is a customer of this org, however the ticket
   // arrived. Doing it here rather than in each caller is what lets someone who
   // has only ever emailed sign in to the portal and find their history: the row
@@ -230,30 +403,42 @@ export async function createTicket(
       ? (await findOrCreateCustomer(orgId, fields.requesterEmail, null)).id
       : null);
 
+  const sla = await calculateSlaDeadlines(orgId, effectivePriority);
+
   const ticketId = await insert(
     `INSERT INTO tickets
        (org_id, subject, description, priority, requester_email,
-        source_message_id, queue_id, requester_customer_id,
-        public_token, public_token_expires_at)
+        source_message_id, queue_id, assigned_agent_id, requester_customer_id,
+        public_token, public_token_expires_at,
+        sla_policy_id, sla_first_response_due_at, sla_resolution_due_at,
+        sla_first_response_breached, sla_resolution_breached, sla_breached)
      VALUES (?, ?, ?, ?, ?, ?,
         COALESCE((SELECT id FROM queues WHERE id = ? AND org_id = ?), ?),
-        (SELECT id FROM customers WHERE id = ? AND org_id = ?), ?, ?)`,
+        (SELECT id FROM agents WHERE id = ? AND org_id = ?),
+        (SELECT id FROM customers WHERE id = ? AND org_id = ?), ?, ?,
+        ?, ?, ?,
+        0, 0, 0)`,
     [
       orgId,
       fields.subject,
-      fields.description,
-      fields.priority,
-      fields.requesterEmail,
+      fields.description ?? null,
+      effectivePriority,
+      fields.requesterEmail ?? null,
       fields.sourceMessageId ?? null,
-      fields.queueId ?? null,
+      targetQueueId,
       orgId,
       fallbackQueueId,
+      initialAssigneeId,
+      orgId,
       // Scoped like every other client-supplied id: a customer belonging to
       // another tenant resolves to NULL rather than linking across the boundary.
       requesterCustomerId,
       orgId,
       fields.publicToken ?? null,
       fields.publicTokenExpiresAt ?? null,
+      sla.policyId,
+      sla.firstResponseDueAt,
+      sla.resolutionDueAt,
     ],
   );
 
@@ -261,6 +446,22 @@ export async function createTicket(
     actorAgentId: fields.actorAgentId ?? null,
     to: fields.source ?? (fields.actorAgentId ? "agent" : "email"),
   });
+
+  if (routing.matchedRule) {
+    await recordEvent(orgId, ticketId, "rule_applied", {
+      to: routing.matchedRule.name,
+    });
+
+    if (routing.assignedAgentId) {
+      await createNotification(orgId, {
+        agentId: routing.assignedAgentId,
+        ticketId,
+        type: "ticket_assigned",
+        title: "Ticket assigned via routing rule",
+        body: `Ticket #${ticketId} (${fields.subject}) was routed to you by rule "${routing.matchedRule.name}".`,
+      });
+    }
+  }
 
   return ticketId;
 }
@@ -304,10 +505,36 @@ export async function updateStatus(
                 THEN COALESCE(resolved_at, datetime('now'))
               ELSE NULL
             END,
+            sla_resolution_breached = CASE
+              WHEN ? IN ('resolved', 'closed') AND resolved_at IS NULL AND sla_resolution_due_at IS NOT NULL AND datetime('now') > sla_resolution_due_at
+                THEN 1
+              ELSE COALESCE(sla_resolution_breached, 0)
+            END,
+            sla_breached = CASE
+              WHEN ? IN ('resolved', 'closed') AND resolved_at IS NULL AND sla_resolution_due_at IS NOT NULL AND datetime('now') > sla_resolution_due_at
+                THEN 1
+              ELSE COALESCE(sla_breached, 0)
+            END,
             updated_at = datetime('now')
       WHERE id = ? AND org_id = ?`,
-    [status, status, ticketId, orgId],
+    [status, status, status, status, ticketId, orgId],
   );
+
+  const ticket = await queryOne<{ sla_resolution_breached: number }>(
+    `SELECT sla_resolution_breached FROM tickets WHERE id = ? AND org_id = ?`,
+    [ticketId, orgId],
+  );
+  if (ticket && Number(ticket.sla_resolution_breached) === 1) {
+    const existing = await queryOne<{ id: number }>(
+      `SELECT id FROM ticket_events WHERE org_id = ? AND ticket_id = ? AND kind = 'sla_breached' AND to_value LIKE '%Resolution%'`,
+      [orgId, ticketId],
+    );
+    if (!existing) {
+      await recordEvent(orgId, ticketId, "sla_breached", {
+        to: "Resolution overdue",
+      });
+    }
+  }
 }
 
 /**
@@ -320,10 +547,39 @@ export async function markFirstResponse(
   ticketId: number,
 ): Promise<boolean> {
   const rows = await executeCounting(
-    `UPDATE tickets SET first_response_at = datetime('now')
+    `UPDATE tickets
+        SET first_response_at = datetime('now'),
+            sla_first_response_breached = CASE
+              WHEN sla_first_response_due_at IS NOT NULL AND datetime('now') > sla_first_response_due_at
+                THEN 1
+              ELSE COALESCE(sla_first_response_breached, 0)
+            END,
+            sla_breached = CASE
+              WHEN sla_first_response_due_at IS NOT NULL AND datetime('now') > sla_first_response_due_at
+                THEN 1
+              ELSE COALESCE(sla_breached, 0)
+            END
       WHERE id = ? AND org_id = ? AND first_response_at IS NULL`,
     [ticketId, orgId],
   );
+
+  if (rows > 0) {
+    const ticket = await queryOne<{ sla_first_response_breached: number }>(
+      `SELECT sla_first_response_breached FROM tickets WHERE id = ? AND org_id = ?`,
+      [ticketId, orgId],
+    );
+    if (ticket && Number(ticket.sla_first_response_breached) === 1) {
+      const existing = await queryOne<{ id: number }>(
+        `SELECT id FROM ticket_events WHERE org_id = ? AND ticket_id = ? AND kind = 'sla_breached' AND to_value LIKE '%First response%'`,
+        [orgId, ticketId],
+      );
+      if (!existing) {
+        await recordEvent(orgId, ticketId, "sla_breached", {
+          to: "First response overdue",
+        });
+      }
+    }
+  }
 
   return rows > 0;
 }
@@ -333,10 +589,22 @@ export async function updatePriority(
   ticketId: number,
   priority: Priority,
 ): Promise<void> {
+  const sla = await calculateSlaDeadlines(orgId, priority);
+
   await execute(
-    `UPDATE tickets SET priority = ?, updated_at = datetime('now')
+    `UPDATE tickets
+        SET priority = ?,
+            sla_first_response_due_at = CASE
+              WHEN first_response_at IS NULL THEN ?
+              ELSE sla_first_response_due_at
+            END,
+            sla_resolution_due_at = CASE
+              WHEN status NOT IN ('resolved', 'closed') THEN ?
+              ELSE sla_resolution_due_at
+            END,
+            updated_at = datetime('now')
       WHERE id = ? AND org_id = ?`,
-    [priority, ticketId, orgId],
+    [priority, sla.firstResponseDueAt, sla.resolutionDueAt, ticketId, orgId],
   );
 }
 
@@ -503,3 +771,84 @@ export async function touchTicket(
     [ticketId, orgId],
   );
 }
+
+export type BulkUpdateParams =
+  | { action: "status"; status: Status }
+  | { action: "priority"; priority: Priority }
+  | { action: "assignee"; assignedAgentId: number | null }
+  | { action: "queue"; queueId: number };
+
+/**
+ * Updates multiple tickets in bulk, strictly bounded to orgId.
+ * Validates mutable status and records individual audit events.
+ */
+export async function bulkUpdateTickets(
+  orgId: number,
+  ticketIds: number[],
+  update: BulkUpdateParams,
+  actor: { agentId: number; role?: string },
+): Promise<number> {
+  if (ticketIds.length === 0) return 0;
+
+  const placeholders = ticketIds.map(() => "?").join(", ");
+  const tickets = await query<Ticket>(
+    `${SELECT_TICKET} WHERE t.org_id = ? AND t.id IN (${placeholders})`,
+    [orgId, ...ticketIds],
+  );
+
+  let updatedCount = 0;
+
+  for (const ticket of tickets) {
+    if (update.action === "status") {
+      if (ticket.status === update.status) continue;
+      if (ticket.status === "closed" && actor.role !== "owner") continue;
+      if (!canTransition(ticket.status, update.status)) continue;
+
+      await updateStatus(orgId, ticket.id, update.status);
+      await recordEvent(orgId, ticket.id, "status_changed", {
+        actorAgentId: actor.agentId,
+        from: ticket.status,
+        to: update.status,
+      });
+      updatedCount++;
+    } else if (update.action === "priority") {
+      if (ticket.status === "closed") continue;
+      if (ticket.priority === update.priority) continue;
+
+      await updatePriority(orgId, ticket.id, update.priority);
+      await recordEvent(orgId, ticket.id, "priority_changed", {
+        actorAgentId: actor.agentId,
+        from: ticket.priority,
+        to: update.priority,
+      });
+      updatedCount++;
+    } else if (update.action === "assignee") {
+      if (ticket.status === "closed") continue;
+      if (ticket.assigned_agent_id === update.assignedAgentId) continue;
+
+      await updateAssignee(orgId, ticket.id, update.assignedAgentId);
+      const updated = await getTicket(orgId, ticket.id);
+      await recordEvent(orgId, ticket.id, "assignee_changed", {
+        actorAgentId: actor.agentId,
+        from: ticket.assigned_agent_name ?? "Unassigned",
+        to: updated?.assigned_agent_name ?? "Unassigned",
+      });
+      updatedCount++;
+    } else if (update.action === "queue") {
+      if (ticket.status === "closed") continue;
+      if (ticket.queue_id === update.queueId) continue;
+
+      await updateQueue(orgId, ticket.id, update.queueId);
+      const updated = await getTicket(orgId, ticket.id);
+      await recordEvent(orgId, ticket.id, "queue_changed", {
+        actorAgentId: actor.agentId,
+        from: ticket.queue_name,
+        to: updated?.queue_name,
+      });
+      updatedCount++;
+    }
+  }
+
+  return updatedCount;
+}
+

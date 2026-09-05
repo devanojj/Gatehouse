@@ -80,8 +80,26 @@ export function slugFromAddress(address: string): string | null {
 }
 
 /**
+ * Turns arbitrary text into a URL-friendly slug.
+ */
+export function slugifyText(text: string, maxLength: number = 60): string {
+  const base = text
+    .toLowerCase()
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, maxLength)
+    .replace(/-+$/, "");
+
+  return base || "item";
+}
+
+/**
  * How many times to re-roll a generated slug before giving up on a collision.
  * The unique index on `organizations.inbound_slug` is the real arbiter; this is
  * only how patient a caller should be about losing the race.
  */
 export const SLUG_ATTEMPTS = 5;
+
+

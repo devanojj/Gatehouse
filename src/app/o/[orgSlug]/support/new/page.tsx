@@ -22,7 +22,7 @@ export default async function NewRequestPage({
     <div className="portal-panel">
       <h1>Raise a request</h1>
       <p className="muted">
-        {org.name} will reply by email, and you can follow it here.
+        {org.name} will reply by email, and you can follow it here. Looking for instant answers? Check our <a href={`/o/${orgSlug}/kb`}>Help Center</a> first.
       </p>
 
       <div className="card card-pad">

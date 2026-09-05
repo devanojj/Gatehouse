@@ -18,6 +18,7 @@ import {
   normalizeEmail,
   recentTicketCount,
 } from "@/lib/customers";
+import { createNotification } from "@/lib/notifications";
 import { findOrganizationByPortalSlug } from "@/lib/orgs";
 import {
   createTicket,
@@ -229,6 +230,16 @@ export async function customerReplyAction(
   });
   await touchTicket(session.orgId, ticketId);
   await reopenIfResolved(session.orgId, ticket);
+
+  if (ticket.assigned_agent_id) {
+    await createNotification(session.orgId, {
+      agentId: ticket.assigned_agent_id,
+      ticketId,
+      type: "customer_reply",
+      title: "New Customer Reply",
+      body: `Customer replied on ticket #${ticketId} ("${ticket.subject}"): "${body.slice(0, 100)}${body.length > 100 ? "…" : ""}"`,
+    });
+  }
 
   revalidatePath(`/tickets/${ticketId}`);
   revalidatePath("/tickets");

@@ -21,7 +21,10 @@ export default async function PortalHome({
       </p>
 
       <div className="portal-actions">
-        <Link className="btn btn-primary" href={`/o/${orgSlug}/support/new`}>
+        <Link className="btn btn-primary" href={`/o/${orgSlug}/kb`}>
+          Browse Help Center
+        </Link>
+        <Link className="btn btn-secondary" href={`/o/${orgSlug}/support/new`}>
           Raise a request
         </Link>
         <Link className="btn btn-secondary" href={`/o/${orgSlug}/support/login`}>

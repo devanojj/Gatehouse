@@ -77,6 +77,30 @@ export const TIMELINE_NOW = `strftime('%Y-%m-%d %H:%M:%f', 'now')`;
 
 export type Row = Record<string, unknown>;
 
+/**
+ * libSQL hands back `Row` objects — array-like, with a prototype, and carrying
+ * numeric indices alongside the column names. React refuses to serialize those
+ * across the Server/Client Component boundary ("Only plain objects can be
+ * passed..."), and a row that reaches a client component would ship every
+ * column it holds to the browser besides.
+ *
+ * Rebuilding each row from `result.columns` gives a plain object with exactly
+ * the named columns and nothing else, once, here — rather than each caller
+ * remembering to do it.
+ */
+function toPlainRows<T>(result: {
+  columns: string[];
+  rows: unknown[];
+}): T[] {
+  return result.rows.map((row) => {
+    const plain: Row = {};
+    result.columns.forEach((column, index) => {
+      plain[column] = (row as Record<number, unknown>)[index];
+    });
+    return plain as T;
+  });
+}
+
 export async function query<T = Row>(
   sql: string,
   args: unknown[] = [],
@@ -86,7 +110,7 @@ export async function query<T = Row>(
     sql,
     args: args as never,
   });
-  return result.rows as unknown as T[];
+  return toPlainRows<T>(result);
 }
 
 export async function queryOne<T = Row>(

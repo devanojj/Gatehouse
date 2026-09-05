@@ -5,6 +5,7 @@
   "scripts": {
     "dev": "next dev",
     "dev:scratch": "TURSO_DATABASE_URL=file:./scratch.db next dev",
+    "seed:demo": "node --conditions=react-server --import tsx scripts/seed-demo.mts",
     "build": "next build",
     "start": "next start",
     "lint": "eslint",

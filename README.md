@@ -123,6 +123,46 @@ Not handled yet: attachments, HTML-only mail (the ticket is still created, with
 a note in place of the body), trimming quoted reply text, reopening a closed
 ticket when a reply arrives, and scheduled polling — collection is manual.
 
+## Scheduled tasks
+
+`/api/cron` is the one route handler in the app — everything else is a Server
+Action — because Vercel Cron needs something to call over HTTP. Each run
+evaluates SLA deadlines and flags what has breached, warns on what is close,
+collects inbound mail for every tenant, and closes tickets that have sat
+resolved for seven days. The schedule lives in `vercel.json`.
+
+**It runs once a day, at 07:00 UTC, and that is a plan limit rather than a
+choice.** Vercel's Hobby plan allows only daily cron jobs, so a breach is
+noticed the morning after it happens and inbound mail is collected once a day.
+Two ways to make it useful:
+
+- Upgrade the Vercel project to Pro and change the schedule in `vercel.json` to
+  `*/15 * * * *`, which is the granularity SLA warnings actually need.
+- Or leave the plan alone and have something else call the endpoint on the
+  interval you want — an uptime pinger or a GitHub Actions schedule sending the
+  same header:
+
+  ```
+  curl -H "Authorization: Bearer $CRON_SECRET" https://your-deployment/api/cron
+  ```
+
+Until one of those is in place, **Settings → SLA** has a button that runs the
+sweep by hand.
+
+It sweeps **every organization**, so it fails closed. Set `CRON_SECRET` in the
+deployment's environment variables — Vercel Cron sends it as
+`Authorization: Bearer <secret>` on its own — and the route rejects anything
+else. In production a missing secret is a misconfiguration and the route
+answers 503 rather than running; locally it is unset and the route is open, so
+you can trigger a sweep by hand:
+
+```bash
+curl http://localhost:3000/api/cron
+```
+
+The secret is never accepted in a query string: those end up in access logs and
+referrer headers.
+
 ## How tenant isolation works
 
 Isolation is enforced in depth rather than in one place:

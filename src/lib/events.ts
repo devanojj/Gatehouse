@@ -1,6 +1,6 @@
 import "server-only";
 
-import { executeCounting, query, TIMELINE_NOW } from "./db";
+import { executeCounting, query, queryOne, TIMELINE_NOW } from "./db";
 
 /**
  * Everything that happens to a ticket other than the conversation itself.
@@ -12,6 +12,9 @@ export const EVENT_KINDS = [
   "priority_changed",
   "assignee_changed",
   "queue_changed",
+  "sla_breached",
+  "sla_warning",
+  "rule_applied",
 ] as const;
 
 export type EventKind = (typeof EVENT_KINDS)[number];
@@ -90,3 +93,119 @@ export async function listEvents(
     [orgId, ticketId],
   );
 }
+
+export type AuditEvent = TicketEvent & {
+  ticket_subject: string | null;
+};
+
+export type AuditFilters = {
+  actorAgentId?: number | null;
+  kind?: EventKind | null;
+  ticketId?: number | null;
+  fromDate?: string | null;
+  toDate?: string | null;
+  limit?: number;
+  offset?: number;
+};
+
+/**
+ * Lists audit events across tickets within an organization, supporting
+ * filtering by actor, event kind, ticket ID, and date range.
+ */
+export async function listAuditEvents(
+  orgId: number,
+  filters: AuditFilters = {},
+): Promise<AuditEvent[]> {
+  const conditions: string[] = ["e.org_id = ?"];
+  const params: unknown[] = [orgId];
+
+  if (filters.actorAgentId !== undefined && filters.actorAgentId !== null) {
+    conditions.push("e.actor_agent_id = ?");
+    params.push(filters.actorAgentId);
+  }
+
+  if (filters.kind) {
+    conditions.push("e.kind = ?");
+    params.push(filters.kind);
+  }
+
+  if (filters.ticketId) {
+    conditions.push("e.ticket_id = ?");
+    params.push(filters.ticketId);
+  }
+
+  if (filters.fromDate) {
+    conditions.push("e.created_at >= ?");
+    params.push(filters.fromDate);
+  }
+
+  if (filters.toDate) {
+    conditions.push("e.created_at <= ?");
+    params.push(filters.toDate);
+  }
+
+  const limit = Math.min(100, Math.max(1, filters.limit ?? 50));
+  const offset = Math.max(0, filters.offset ?? 0);
+  params.push(limit, offset);
+
+  return query<AuditEvent>(
+    `SELECT e.*, a.name AS actor_agent_name, t.subject AS ticket_subject
+       FROM ticket_events e
+       LEFT JOIN agents a
+         ON a.id = e.actor_agent_id
+        AND a.org_id = e.org_id
+       LEFT JOIN tickets t
+         ON t.id = e.ticket_id
+        AND t.org_id = e.org_id
+      WHERE ${conditions.join(" AND ")}
+      ORDER BY e.created_at DESC, e.id DESC
+      LIMIT ? OFFSET ?`,
+    params,
+  );
+}
+
+/**
+ * Counts total matching audit events for pagination.
+ */
+export async function countAuditEvents(
+  orgId: number,
+  filters: Omit<AuditFilters, "limit" | "offset"> = {},
+): Promise<number> {
+  const conditions: string[] = ["e.org_id = ?"];
+  const params: unknown[] = [orgId];
+
+  if (filters.actorAgentId !== undefined && filters.actorAgentId !== null) {
+    conditions.push("e.actor_agent_id = ?");
+    params.push(filters.actorAgentId);
+  }
+
+  if (filters.kind) {
+    conditions.push("e.kind = ?");
+    params.push(filters.kind);
+  }
+
+  if (filters.ticketId) {
+    conditions.push("e.ticket_id = ?");
+    params.push(filters.ticketId);
+  }
+
+  if (filters.fromDate) {
+    conditions.push("e.created_at >= ?");
+    params.push(filters.fromDate);
+  }
+
+  if (filters.toDate) {
+    conditions.push("e.created_at <= ?");
+    params.push(filters.toDate);
+  }
+
+  const row = await queryOne<{ total: number }>(
+    `SELECT COUNT(*) AS total
+       FROM ticket_events e
+      WHERE ${conditions.join(" AND ")}`,
+    params,
+  );
+
+  return Number(row?.total ?? 0);
+}
+

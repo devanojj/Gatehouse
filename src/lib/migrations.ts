@@ -308,6 +308,230 @@ export const MIGRATIONS: Migration[] = [
       await backfillPortalSlugs(tx);
     },
   },
+
+  {
+    // Full-text search (FTS5) over tickets, comments, and requesters, plus
+    // custom saved views for agents. Triggers keep the search index in step
+    // with ticket and comment writes automatically.
+    name: "006_search_and_saved_views",
+    up: async (tx) => {
+      await run(tx, [
+        `CREATE VIRTUAL TABLE IF NOT EXISTS tickets_fts USING fts5(
+          ticket_id UNINDEXED,
+          org_id UNINDEXED,
+          comment_id UNINDEXED,
+          title,
+          body,
+          requester,
+          tokenize = 'unicode61'
+        )`,
+        `CREATE TRIGGER IF NOT EXISTS tickets_fts_ai AFTER INSERT ON tickets BEGIN
+          INSERT INTO tickets_fts(ticket_id, org_id, comment_id, title, body, requester)
+          VALUES (new.id, new.org_id, 0, new.subject, COALESCE(new.description, ''), COALESCE(new.requester_email, ''));
+        END`,
+        `CREATE TRIGGER IF NOT EXISTS tickets_fts_au AFTER UPDATE OF subject, description, requester_email ON tickets BEGIN
+          DELETE FROM tickets_fts WHERE ticket_id = old.id AND comment_id = 0;
+          INSERT INTO tickets_fts(ticket_id, org_id, comment_id, title, body, requester)
+          VALUES (new.id, new.org_id, 0, new.subject, COALESCE(new.description, ''), COALESCE(new.requester_email, ''));
+        END`,
+        `CREATE TRIGGER IF NOT EXISTS tickets_fts_ad AFTER DELETE ON tickets BEGIN
+          DELETE FROM tickets_fts WHERE ticket_id = old.id;
+        END`,
+        `CREATE TRIGGER IF NOT EXISTS comments_fts_ai AFTER INSERT ON comments BEGIN
+          INSERT INTO tickets_fts(ticket_id, org_id, comment_id, title, body, requester)
+          VALUES (new.ticket_id, new.org_id, new.id, '', new.body, COALESCE(new.author_email, ''));
+        END`,
+        `CREATE TRIGGER IF NOT EXISTS comments_fts_au AFTER UPDATE OF body ON comments BEGIN
+          DELETE FROM tickets_fts WHERE comment_id = old.id;
+          INSERT INTO tickets_fts(ticket_id, org_id, comment_id, title, body, requester)
+          VALUES (new.ticket_id, new.org_id, new.id, '', new.body, COALESCE(new.author_email, ''));
+        END`,
+        `CREATE TRIGGER IF NOT EXISTS comments_fts_ad AFTER DELETE ON comments BEGIN
+          DELETE FROM tickets_fts WHERE comment_id = old.id;
+        END`,
+        `CREATE TABLE IF NOT EXISTS saved_views (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          org_id INTEGER NOT NULL REFERENCES organizations(id),
+          name TEXT NOT NULL,
+          filters TEXT NOT NULL,
+          created_by_agent_id INTEGER REFERENCES agents(id),
+          created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )`,
+        `CREATE INDEX IF NOT EXISTS idx_saved_views_org
+           ON saved_views(org_id, name COLLATE NOCASE)`,
+      ]);
+
+      const existing = await tx.execute(`SELECT COUNT(*) AS n FROM tickets_fts`);
+      if (Number(existing.rows[0].n) === 0) {
+        await tx.execute(`
+          INSERT INTO tickets_fts (ticket_id, org_id, comment_id, title, body, requester)
+          SELECT id, org_id, 0, subject, COALESCE(description, ''), COALESCE(requester_email, '')
+            FROM tickets
+        `);
+        await tx.execute(`
+          INSERT INTO tickets_fts (ticket_id, org_id, comment_id, title, body, requester)
+          SELECT ticket_id, org_id, id, '', body, COALESCE(author_email, '')
+            FROM comments
+        `);
+      }
+    },
+  },
+
+  {
+    // Knowledge base: categories, articles with draft/published lifecycle,
+    // and full-text search over published content.
+    name: "007_knowledge_base",
+    up: async (tx) => {
+      await run(tx, [
+        `CREATE TABLE IF NOT EXISTS kb_categories (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          org_id INTEGER NOT NULL REFERENCES organizations(id),
+          name TEXT NOT NULL,
+          slug TEXT NOT NULL,
+          description TEXT,
+          position INTEGER NOT NULL DEFAULT 0,
+          created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )`,
+        `CREATE UNIQUE INDEX IF NOT EXISTS idx_kb_categories_org_slug
+           ON kb_categories(org_id, slug)`,
+        `CREATE INDEX IF NOT EXISTS idx_kb_categories_org
+           ON kb_categories(org_id, position, name COLLATE NOCASE)`,
+        `CREATE TABLE IF NOT EXISTS articles (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          org_id INTEGER NOT NULL REFERENCES organizations(id),
+          category_id INTEGER REFERENCES kb_categories(id) ON DELETE SET NULL,
+          title TEXT NOT NULL,
+          slug TEXT NOT NULL,
+          body TEXT NOT NULL,
+          status TEXT NOT NULL DEFAULT 'draft',
+          author_agent_id INTEGER REFERENCES agents(id),
+          published_at TEXT,
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )`,
+        `CREATE UNIQUE INDEX IF NOT EXISTS idx_articles_org_slug
+           ON articles(org_id, slug)`,
+        `CREATE INDEX IF NOT EXISTS idx_articles_org_status
+           ON articles(org_id, status, updated_at DESC)`,
+        `CREATE INDEX IF NOT EXISTS idx_articles_org_category
+           ON articles(org_id, category_id, status)`,
+        `CREATE VIRTUAL TABLE IF NOT EXISTS articles_fts USING fts5(
+          article_id UNINDEXED,
+          org_id UNINDEXED,
+          title,
+          body,
+          tokenize = 'unicode61'
+        )`,
+        `CREATE TRIGGER IF NOT EXISTS articles_fts_ai AFTER INSERT ON articles BEGIN
+          INSERT INTO articles_fts(article_id, org_id, title, body)
+          VALUES (new.id, new.org_id, new.title, new.body);
+        END`,
+        `CREATE TRIGGER IF NOT EXISTS articles_fts_au AFTER UPDATE OF title, body ON articles BEGIN
+          DELETE FROM articles_fts WHERE article_id = old.id;
+          INSERT INTO articles_fts(article_id, org_id, title, body)
+          VALUES (new.id, new.org_id, new.title, new.body);
+        END`,
+        `CREATE TRIGGER IF NOT EXISTS articles_fts_ad AFTER DELETE ON articles BEGIN
+          DELETE FROM articles_fts WHERE article_id = old.id;
+        END`,
+      ]);
+    },
+  },
+
+  {
+    // Service Level Agreements (SLA) tracking, priority targets, ticket deadlines,
+    // and agent notification inbox.
+    name: "008_sla_and_notifications",
+    up: async (tx) => {
+      await run(tx, [
+        `CREATE TABLE IF NOT EXISTS sla_policies (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          org_id INTEGER NOT NULL REFERENCES organizations(id),
+          name TEXT NOT NULL,
+          description TEXT,
+          is_default INTEGER NOT NULL DEFAULT 1,
+          created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )`,
+        `CREATE INDEX IF NOT EXISTS idx_sla_policies_org
+           ON sla_policies(org_id, is_default DESC)`,
+        `CREATE TABLE IF NOT EXISTS sla_targets (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          org_id INTEGER NOT NULL REFERENCES organizations(id),
+          policy_id INTEGER NOT NULL REFERENCES sla_policies(id) ON DELETE CASCADE,
+          priority TEXT NOT NULL,
+          first_response_hours INTEGER NOT NULL,
+          resolution_hours INTEGER NOT NULL,
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )`,
+        `CREATE UNIQUE INDEX IF NOT EXISTS idx_sla_targets_policy_priority
+           ON sla_targets(policy_id, priority)`,
+        `CREATE INDEX IF NOT EXISTS idx_sla_targets_org
+           ON sla_targets(org_id)`,
+        `CREATE TABLE IF NOT EXISTS notifications (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          org_id INTEGER NOT NULL REFERENCES organizations(id),
+          agent_id INTEGER NOT NULL REFERENCES agents(id),
+          ticket_id INTEGER REFERENCES tickets(id) ON DELETE CASCADE,
+          type TEXT NOT NULL,
+          title TEXT NOT NULL,
+          body TEXT NOT NULL,
+          read_at TEXT,
+          created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )`,
+        `CREATE INDEX IF NOT EXISTS idx_notifications_agent_unread
+           ON notifications(org_id, agent_id, read_at, created_at DESC)`,
+      ]);
+
+      await addColumn(tx, "tickets", "sla_policy_id", "INTEGER");
+      await addColumn(tx, "tickets", "sla_first_response_due_at", "TEXT");
+      await addColumn(tx, "tickets", "sla_resolution_due_at", "TEXT");
+      await addColumn(tx, "tickets", "sla_first_response_breached", "INTEGER NOT NULL DEFAULT 0");
+      await addColumn(tx, "tickets", "sla_resolution_breached", "INTEGER NOT NULL DEFAULT 0");
+      await addColumn(tx, "tickets", "sla_breached", "INTEGER NOT NULL DEFAULT 0");
+
+      await run(tx, [
+        `CREATE INDEX IF NOT EXISTS idx_tickets_sla_breached
+           ON tickets(org_id, sla_breached, status)`,
+      ]);
+
+      await backfillDefaultSlaPolicies(tx);
+    },
+  },
+
+  {
+    name: "009_routing_and_audit",
+    up: async (tx) => {
+      await run(tx, [
+        `CREATE TABLE IF NOT EXISTS routing_rules (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          org_id INTEGER NOT NULL REFERENCES organizations(id),
+          name TEXT NOT NULL,
+          description TEXT,
+          position INTEGER NOT NULL DEFAULT 0,
+          is_active INTEGER NOT NULL DEFAULT 1,
+          match_field TEXT NOT NULL,
+          match_operator TEXT NOT NULL,
+          match_value TEXT NOT NULL,
+          target_queue_id INTEGER REFERENCES queues(id) ON DELETE SET NULL,
+          target_agent_id INTEGER REFERENCES agents(id) ON DELETE SET NULL,
+          target_priority TEXT,
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )`,
+        `CREATE INDEX IF NOT EXISTS idx_routing_rules_org_pos
+           ON routing_rules(org_id, position, is_active)`,
+        `CREATE INDEX IF NOT EXISTS idx_tickets_org_created
+           ON tickets(org_id, created_at DESC)`,
+        `CREATE INDEX IF NOT EXISTS idx_tickets_org_resolved
+           ON tickets(org_id, resolved_at DESC)`,
+        `CREATE INDEX IF NOT EXISTS idx_ticket_events_org_created
+           ON ticket_events(org_id, created_at DESC)`,
+        `CREATE INDEX IF NOT EXISTS idx_ticket_events_org_kind
+           ON ticket_events(org_id, kind, created_at DESC)`,
+      ]);
+    },
+  },
 ];
 
 /**
@@ -467,3 +691,65 @@ async function backfillInboundSlugs(tx: Transaction): Promise<void> {
     }
   }
 }
+
+/**
+ * Ensures every existing organization has a default SLA policy and targets,
+ * and sets default SLA deadlines on existing open tickets.
+ */
+async function backfillDefaultSlaPolicies(tx: Transaction): Promise<void> {
+  const orgs = await tx.execute(`SELECT id FROM organizations`);
+
+  for (const org of orgs.rows) {
+    const orgId = Number(org.id);
+    const existing = await tx.execute({
+      sql: `SELECT id FROM sla_policies WHERE org_id = ? AND is_default = 1`,
+      args: [orgId],
+    });
+
+    let policyId: number;
+    if (existing.rows.length === 0) {
+      const res = await tx.execute({
+        sql: `INSERT INTO sla_policies (org_id, name, description, is_default)
+              VALUES (?, 'Standard SLA', 'Default SLA policy for response and resolution targets.', 1)`,
+        args: [orgId],
+      });
+      policyId = Number(res.lastInsertRowid);
+
+      await tx.execute({
+        sql: `INSERT OR IGNORE INTO sla_targets (org_id, policy_id, priority, first_response_hours, resolution_hours)
+              VALUES (?, ?, 'high', 1, 8),
+                     (?, ?, 'medium', 4, 24),
+                     (?, ?, 'low', 8, 72)`,
+        args: [orgId, policyId, orgId, policyId, orgId, policyId],
+      });
+    }
+  }
+
+  // Backfill deadlines on existing tickets that don't have them
+  await tx.execute(`
+    UPDATE tickets
+       SET sla_first_response_due_at = datetime(created_at, '+1 hours'),
+           sla_resolution_due_at = datetime(created_at, '+8 hours')
+     WHERE priority = 'high' AND sla_first_response_due_at IS NULL
+  `);
+  await tx.execute(`
+    UPDATE tickets
+       SET sla_first_response_due_at = datetime(created_at, '+4 hours'),
+           sla_resolution_due_at = datetime(created_at, '+24 hours')
+     WHERE priority = 'medium' AND sla_first_response_due_at IS NULL
+  `);
+  await tx.execute(`
+    UPDATE tickets
+       SET sla_first_response_due_at = datetime(created_at, '+8 hours'),
+           sla_resolution_due_at = datetime(created_at, '+72 hours')
+     WHERE priority = 'low' AND sla_first_response_due_at IS NULL
+  `);
+
+  await tx.execute(`
+    UPDATE tickets
+       SET sla_first_response_breached = COALESCE(sla_first_response_breached, 0),
+           sla_resolution_breached = COALESCE(sla_resolution_breached, 0),
+           sla_breached = COALESCE(sla_breached, 0)
+  `);
+}
+

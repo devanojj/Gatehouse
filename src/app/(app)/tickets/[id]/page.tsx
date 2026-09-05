@@ -15,6 +15,7 @@ import { listEvents } from "@/lib/events";
 import { formatDateTime, PRIORITY_LABELS, STATUS_LABELS } from "@/lib/format";
 import { listQueues } from "@/lib/queues";
 import { allowedTransitions, getTicket, PRIORITIES } from "@/lib/tickets";
+import { evaluateTicketSla } from "@/lib/sla";
 import { PriorityBadge, StatusBadge } from "@/app/ui/Badge";
 
 import type { Comment, CommentType } from "@/lib/comments";
@@ -93,6 +94,12 @@ function describeEvent(event: TicketEvent): string {
       return `${who} changed the assignee from ${event.from_value} to ${event.to_value}`;
     case "queue_changed":
       return `${who} moved this ticket from ${event.from_value} to ${event.to_value}`;
+    case "sla_breached":
+      return `SLA deadline breached: ${event.to_value ?? "Target missed"}`;
+    case "sla_warning":
+      return `SLA alert: ${event.to_value ?? "Approaching deadline"}`;
+    case "rule_applied":
+      return `Routing rule applied: ${event.to_value ?? "Automated triage"}`;
   }
 }
 
@@ -130,6 +137,7 @@ export default async function TicketPage({
   // place. The server enforces this too — this is what stops the controls from
   // offering something that would only throw.
   const locked = ticket.status === "closed";
+  const sla = evaluateTicketSla(ticket);
 
   // Only the moves the ticket can actually make from where it is now.
   const statusOptions = locked
@@ -324,6 +332,50 @@ export default async function TicketPage({
               <div className="meta-row">
                 <dt>Updated</dt>
                 <dd>{formatDateTime(ticket.updated_at)}</dd>
+              </div>
+            </dl>
+          </div>
+
+          <div className="card card-pad">
+            <div className="section-title">SLA Performance</div>
+            <dl>
+              <div className="meta-row">
+                <dt>First Response</dt>
+                <dd>
+                  {sla.firstResponse.status === "fulfilled" ? (
+                    <span className="badge badge-teal">Fulfilled</span>
+                  ) : sla.firstResponse.status === "breached" ? (
+                    <span className="badge badge-red">Breached</span>
+                  ) : sla.firstResponse.dueAt ? (
+                    <span
+                      className="badge badge-amber"
+                      title={`Due by ${formatDateTime(sla.firstResponse.dueAt)}`}
+                    >
+                      Pending
+                    </span>
+                  ) : (
+                    <span className="muted">—</span>
+                  )}
+                </dd>
+              </div>
+              <div className="meta-row">
+                <dt>Resolution</dt>
+                <dd>
+                  {sla.resolution.status === "fulfilled" ? (
+                    <span className="badge badge-teal">Fulfilled</span>
+                  ) : sla.resolution.status === "breached" ? (
+                    <span className="badge badge-red">Breached</span>
+                  ) : sla.resolution.dueAt ? (
+                    <span
+                      className="badge badge-blue"
+                      title={`Due by ${formatDateTime(sla.resolution.dueAt)}`}
+                    >
+                      Pending
+                    </span>
+                  ) : (
+                    <span className="muted">—</span>
+                  )}
+                </dd>
               </div>
             </dl>
           </div>
