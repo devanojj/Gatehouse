@@ -86,10 +86,47 @@ if (tables.length === 0) {
 console.log(`\nTarget: ${target}`);
 console.log(`Dropping ${tables.length} tables: ${tables.join(", ")}\n`);
 
-// Foreign keys are off by default in libSQL, so drop order does not matter.
-for (const table of tables) {
-  await client.execute(`DROP TABLE IF EXISTS "${table}"`);
-  console.log(`  dropped ${table}`);
+function isForeignKeyError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /FOREIGN KEY constraint failed/i.test(message);
+}
+
+/*
+ * Turso enforces foreign keys, and `DROP TABLE` runs an implicit `DELETE FROM`
+ * — so dropping a parent while a child still references its rows fails. Turning
+ * the constraint off is not an option either: `PRAGMA foreign_keys` is a no-op
+ * inside a transaction, which is the only place a pooled HTTP connection would
+ * hold the setting long enough to matter.
+ *
+ * So drop what will drop, repeat, and let the order sort itself out. Each pass
+ * frees the parents of whatever went in the pass before. This needs no map of
+ * the schema, which matters here: the tables left behind by another application
+ * are exactly the ones whose references are unknown.
+ */
+let remaining = tables;
+
+while (remaining.length > 0) {
+  const blocked: string[] = [];
+
+  for (const table of remaining) {
+    try {
+      await client.execute(`DROP TABLE IF EXISTS "${table}"`);
+      console.log(`  dropped ${table}`);
+    } catch (error) {
+      if (!isForeignKeyError(error)) throw error;
+      blocked.push(table);
+    }
+  }
+
+  if (blocked.length === remaining.length) {
+    throw new Error(
+      `Stuck: ${blocked.join(", ")} reference each other in a cycle, so no ` +
+        `order of DROP TABLE will clear them. Empty them first — ` +
+        `DELETE FROM each — and run this again.`,
+    );
+  }
+
+  remaining = blocked;
 }
 
 const left = (
